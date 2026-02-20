@@ -1,11 +1,12 @@
 import argparse
-import math
 import os
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 import torch
 import torch.nn as nn
+from accelerate import Accelerator
+from accelerate.utils import broadcast_object_list, set_seed
 from tqdm import tqdm
 
 from .clip_text import CLIPTextEncoder
@@ -26,7 +27,6 @@ from .utils import (
     now_str,
     save_json,
     save_yaml,
-    seed_everything,
     to_device,
 )
 
@@ -75,7 +75,6 @@ def split_trainable_params(cfg: Dict, model: RadioWrapper, decoder: nn.Module) -
     if not lora_enabled and bool(optimize_cfg.get("model_when_no_lora", False)):
         aux_params += [p for p in model.parameters() if p.requires_grad]
 
-    # Deduplicate while preserving order
     seen = set()
     uniq = []
     for p in aux_params:
@@ -140,6 +139,19 @@ def run_eval(
     save_json({"step": step, "understanding": u, "generation": g}, os.path.join(run_dir, "eval_last.json"))
 
 
+def _dist_mean_scalar(accelerator: Accelerator, value, device: torch.device) -> float:
+    if torch.is_tensor(value):
+        t = value.detach().to(device)
+        if t.ndim > 0:
+            t = t.float().mean()
+        else:
+            t = t.float()
+    else:
+        t = torch.tensor(float(value), device=device, dtype=torch.float32)
+    reduced = accelerator.reduce(t, reduction="mean")
+    return float(reduced.item())
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
@@ -150,18 +162,28 @@ def main() -> None:
     base_cfg = load_yaml(args.config)
     cfg = apply_overrides(base_cfg, args.set)
 
+    mixed_precision = cfg.get("accelerate", {}).get("mixed_precision", "no")
+    accelerator = Accelerator(mixed_precision=mixed_precision)
+    device = accelerator.device
+
     seed = int(cfg.get("seed", 42))
-    seed_everything(seed)
+    set_seed(seed, device_specific=True)
 
     exp_name = args.run_name or cfg.get("experiment", {}).get("name", "exp")
     run_dir = os.path.join(cfg.get("output", {}).get("root", "runs"), exp_name)
-    if os.path.exists(run_dir):
-        run_dir = f"{run_dir}_{now_str()}"
 
-    ckpt_dir = ensure_dir(os.path.join(run_dir, "checkpoints"))
-    save_yaml(cfg, os.path.join(run_dir, "run_config.yaml"))
+    if accelerator.is_main_process:
+        if os.path.exists(run_dir):
+            run_dir = f"{run_dir}_{now_str()}"
+        ckpt_dir = ensure_dir(os.path.join(run_dir, "checkpoints"))
+        save_yaml(cfg, os.path.join(run_dir, "run_config.yaml"))
+    else:
+        ckpt_dir = ""
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    objs = [run_dir, ckpt_dir]
+    broadcast_object_list(objs)
+    run_dir, ckpt_dir = objs[0], objs[1]
+    accelerator.wait_for_everyone()
 
     train_loader, class_names = build_imagenet_loader(
         data_root=cfg["data"]["data_root"],
@@ -196,7 +218,6 @@ def main() -> None:
         teacher_model = build_teacher(cfg, device=device)
 
     lora_params, aux_params = split_trainable_params(cfg, model=model, decoder=decoder)
-
     all_trainable = list(lora_params) + list(aux_params)
     if len(all_trainable) == 0:
         raise RuntimeError("No trainable parameters. Check lora.enable/optimize settings.")
@@ -208,6 +229,8 @@ def main() -> None:
         weight_decay=float(optim_cfg.get("weight_decay", 1e-4)),
     )
 
+    model, decoder, optimizer, train_loader = accelerator.prepare(model, decoder, optimizer, train_loader)
+
     text_cfg = cfg.get("text", {})
     text_encoder = CLIPTextEncoder(
         model_name=text_cfg.get("clip_model", "ViT-B-32"),
@@ -218,7 +241,7 @@ def main() -> None:
     text_embeddings = text_encoder.build_class_embeddings(
         class_names=class_names,
         templates=text_cfg.get("prompt_templates", ["a photo of a {class}"]),
-        cache_path=text_cache,
+        cache_path=text_cache if accelerator.is_main_process else None,
         batch_size=int(text_cfg.get("batch_size", 256)),
     )
 
@@ -237,27 +260,32 @@ def main() -> None:
     cos_curve = []
 
     if steps <= 0:
-        save_checkpoint(
-            os.path.join(ckpt_dir, "latest.pt"),
-            model=model,
-            decoder=decoder,
-            optimizer=optimizer,
-            step=0,
-            cfg=cfg,
-        )
-        run_eval(
-            cfg=cfg,
-            model=model,
-            decoder=decoder,
-            teacher_model=teacher_model,
-            val_loader=val_loader,
-            text_embeddings=text_embeddings,
-            device=device,
-            run_dir=run_dir,
-            step=0,
-        )
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            save_checkpoint(
+                os.path.join(ckpt_dir, "latest.pt"),
+                model=accelerator.unwrap_model(model),
+                decoder=accelerator.unwrap_model(decoder),
+                optimizer=optimizer,
+                step=0,
+                cfg=cfg,
+            )
+            run_eval(
+                cfg=cfg,
+                model=accelerator.unwrap_model(model),
+                decoder=accelerator.unwrap_model(decoder),
+                teacher_model=teacher_model,
+                val_loader=val_loader,
+                text_embeddings=text_embeddings,
+                device=device,
+                run_dir=run_dir,
+                step=0,
+            )
+        accelerator.wait_for_everyone()
+
     train_iter = cycle_loader(train_loader)
-    pbar = tqdm(range(1, steps + 1), desc="train")
+    pbar = tqdm(range(1, steps + 1), desc="train", disable=not accelerator.is_local_main_process)
+
     for step in pbar:
         batch = make_batch_dict(next(train_iter))
         batch = to_device(batch, device)
@@ -307,27 +335,41 @@ def main() -> None:
                 lambda_txt=lambda_txt,
                 lambda_rec=lambda_rec,
             )
+            if accelerator.num_processes > 1:
+                for p in list(lora_params) + list(aux_params):
+                    if p.grad is not None:
+                        p.grad = accelerator.reduce(p.grad, reduction="mean")
             optimizer.step()
         else:
             if step % cos_every == 0 and len(lora_params) > 0:
                 cos = compute_grad_cosine(Lu, Lg, lora_params)
-            total.backward()
+            accelerator.backward(total)
             optimizer.step()
 
-        if step % cos_every == 0:
-            cos_curve.append({"step": step, "cos": cos})
+        cos_global = _dist_mean_scalar(accelerator, cos, device)
+        Lu_global = _dist_mean_scalar(accelerator, Lu, device)
+        Lg_global = _dist_mean_scalar(accelerator, Lg, device)
+        total_global = _dist_mean_scalar(accelerator, total, device)
+        txt_acc_global = _dist_mean_scalar(accelerator, txt_extra.get("txt_acc", 0.0), device)
+
+        rec_extra_global = {}
+        for k, v in rec_extra.items():
+            rec_extra_global[k] = _dist_mean_scalar(accelerator, v, device)
+
+        if step % cos_every == 0 and accelerator.is_main_process:
+            cos_curve.append({"step": step, "cos": cos_global})
 
         row = {
             "step": step,
-            "Lu": float(Lu.item()),
-            "Lg": float(Lg.item()),
-            "total": float(total.item()),
-            "cos": float(cos),
-            "txt_acc": float(txt_extra.get("txt_acc", 0.0)),
+            "Lu": Lu_global,
+            "Lg": Lg_global,
+            "total": total_global,
+            "cos": cos_global,
+            "txt_acc": txt_acc_global,
         }
-        row.update(rec_extra)
+        row.update(rec_extra_global)
 
-        if step % log_every == 0 or step == 1 or step == steps:
+        if accelerator.is_main_process and (step % log_every == 0 or step == 1 or step == steps):
             append_jsonl(metrics_file, row)
             pbar.set_postfix(
                 Lu=f"{row['Lu']:.4f}",
@@ -337,51 +379,60 @@ def main() -> None:
             )
 
         if step % save_every == 0 or step == steps:
-            save_checkpoint(
-                os.path.join(ckpt_dir, "latest.pt"),
-                model=model,
-                decoder=decoder,
-                optimizer=optimizer,
-                step=step,
-                cfg=cfg,
-            )
+            accelerator.wait_for_everyone()
+            if accelerator.is_main_process:
+                save_checkpoint(
+                    os.path.join(ckpt_dir, "latest.pt"),
+                    model=accelerator.unwrap_model(model),
+                    decoder=accelerator.unwrap_model(decoder),
+                    optimizer=optimizer,
+                    step=step,
+                    cfg=cfg,
+                )
+            accelerator.wait_for_everyone()
 
         if step % eval_every == 0 or step == steps:
-            run_eval(
-                cfg=cfg,
-                model=model,
-                decoder=decoder,
-                teacher_model=teacher_model,
-                val_loader=val_loader,
-                text_embeddings=text_embeddings,
-                device=device,
-                run_dir=run_dir,
-                step=step,
-            )
+            accelerator.wait_for_everyone()
+            if accelerator.is_main_process:
+                run_eval(
+                    cfg=cfg,
+                    model=accelerator.unwrap_model(model),
+                    decoder=accelerator.unwrap_model(decoder),
+                    teacher_model=teacher_model,
+                    val_loader=val_loader,
+                    text_embeddings=text_embeddings,
+                    device=device,
+                    run_dir=run_dir,
+                    step=step,
+                )
+            accelerator.wait_for_everyone()
 
-    cos_values = [x["cos"] for x in cos_curve]
-    if len(cos_values) == 0:
-        cos_mean = 0.0
-        cos_neg_ratio = 0.0
-    else:
-        cos_mean = float(sum(cos_values) / len(cos_values))
-        cos_neg_ratio = float(sum(1 for c in cos_values if c < 0) / len(cos_values))
+    if accelerator.is_main_process:
+        cos_values = [x["cos"] for x in cos_curve]
+        if len(cos_values) == 0:
+            cos_mean = 0.0
+            cos_neg_ratio = 0.0
+        else:
+            cos_mean = float(sum(cos_values) / len(cos_values))
+            cos_neg_ratio = float(sum(1 for c in cos_values if c < 0) / len(cos_values))
 
-    summary = {
-        "run_dir": run_dir,
-        "strategy": strategy,
-        "seed": seed,
-        "lambda_txt": lambda_txt,
-        "lambda_rec": lambda_rec,
-        "num_trainable_lora": count_parameters(lora_params),
-        "num_trainable_aux": count_parameters(aux_params),
-        "cos_mean": cos_mean,
-        "cos_neg_ratio": cos_neg_ratio,
-    }
-    save_json(summary, os.path.join(run_dir, "cos_summary.json"))
-    save_json({"curve": cos_curve}, os.path.join(run_dir, "cos_curve.json"))
+        summary = {
+            "run_dir": run_dir,
+            "strategy": strategy,
+            "seed": seed,
+            "lambda_txt": lambda_txt,
+            "lambda_rec": lambda_rec,
+            "num_trainable_lora": count_parameters(lora_params),
+            "num_trainable_aux": count_parameters(aux_params),
+            "cos_mean": cos_mean,
+            "cos_neg_ratio": cos_neg_ratio,
+            "world_size": accelerator.num_processes,
+        }
+        save_json(summary, os.path.join(run_dir, "cos_summary.json"))
+        save_json({"curve": cos_curve}, os.path.join(run_dir, "cos_curve.json"))
 
-    print(f"[train] done. run_dir={run_dir}")
+    accelerator.wait_for_everyone()
+    accelerator.print(f"[train] done. run_dir={run_dir}")
 
 
 if __name__ == "__main__":

@@ -22,7 +22,15 @@ source ~/anaconda3/etc/profile.d/conda.sh
 conda activate "$CONDA_ENV"
 
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-8}
+NPROC_PER_NODE=${NPROC_PER_NODE:-${SLURM_GPUS_ON_NODE:-1}}
+MIXED_PRECISION=${MIXED_PRECISION:-no}
+MAIN_PROCESS_PORT=${MAIN_PROCESS_PORT:-$((10000 + SLURM_JOB_ID % 50000))}
 
-python -u -m unirae.train \
+python -m accelerate.commands.launch \
+  --num_processes "$NPROC_PER_NODE" \
+  --num_machines 1 \
+  --main_process_port "$MAIN_PROCESS_PORT" \
+  --mixed_precision "$MIXED_PRECISION" \
+  -m unirae.train \
   --config "$CONFIG_PATH" \
   --run_name "$RUN_NAME"

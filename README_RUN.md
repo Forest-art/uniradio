@@ -15,7 +15,12 @@ pip install -r requirements.txt
 
 ## 3) 本地 smoke（1000 steps）
 ```bash
-python -u -m unirae.train --config configs/smoke.yaml --run_name smoke_local
+python -m accelerate.commands.launch --num_processes 1 -m unirae.train --config configs/smoke.yaml --run_name smoke_local
+```
+
+多卡本地示例（4 卡）：
+```bash
+python -m accelerate.commands.launch --num_processes 4 -m unirae.train --config configs/smoke.yaml --run_name smoke_local_4gpu
 ```
 
 训练过程中会在 `runs/<run_name>/` 生成：
@@ -35,10 +40,16 @@ sbatch slurm/sbatch_train.sh configs/smoke.yaml smoke_slurm
 默认资源：
 - `--account=peilab`
 - `--partition=preempt`
-- `--gpus-per-node=1`
+- `--gpus-per-node=1`（可在提交时覆盖成多卡）
 - `--cpus-per-task=8`
 - `--mem=32G`
 - `--time=24:00:00`
+
+脚本内部使用 `accelerate launch`；默认 `NPROC_PER_NODE=$SLURM_GPUS_ON_NODE`。
+例如 4 卡运行：
+```bash
+sbatch --gpus-per-node=4 slurm/sbatch_train.sh configs/smoke.yaml smoke_slurm_4gpu
+```
 
 可通过环境变量切换 conda 环境：
 ```bash
@@ -48,7 +59,7 @@ CONDA_ENV=diffuser310 sbatch slurm/sbatch_train.sh configs/smoke.yaml smoke_slur
 ## 5) Sweep（四组对照）
 先跑 1 个 baseline（no finetune）：
 ```bash
-python -u -m unirae.train \
+python -m accelerate.commands.launch --num_processes 1 -m unirae.train \
   --config configs/smoke.yaml \
   --run_name baseline_no_ft \
   --set lora.enable=false \
