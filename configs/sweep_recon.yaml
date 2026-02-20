@@ -1,0 +1,85 @@
+seed: 42
+
+experiment:
+  name: sweep_recon
+  group: recon_only
+
+output:
+  root: runs
+
+data:
+  data_root: /path/to/imagenet
+  class_names_file: null
+  image_size: 224
+  num_workers: 8
+
+radio:
+  code_root: /project/peilab/luxiaocheng/projects/RADIO
+  ckpt: /path/to/radio_checkpoint.pth.tar
+  clip_adaptor: clip
+  dino_adaptor: dino_v2
+  freeze_trunk: true
+  allow_fallback: true
+  output_dim:
+    clip: 1024
+    dino: 1024
+
+lora:
+  enable: true
+  rank: 8
+  alpha: 16
+  target_modules:
+    - "blocks\\..*\\.attn\\.qkv"
+    - "blocks\\..*\\.attn\\.proj"
+    - "blocks\\..*\\.mlp\\.fc1"
+    - "blocks\\..*\\.mlp\\.fc2"
+
+optimize:
+  decoder: true
+  projections: true
+  model_when_no_lora: false
+
+text:
+  clip_model: ViT-B-32
+  clip_pretrained: openai
+  prompt_templates: ["a photo of a {class}"]
+  temperature: 0.07
+  batch_size: 256
+
+decoder:
+  hidden_dim: 1024
+  feature_target_dim: 1024
+  pixel_size: 64
+  token_dropout: 0.0
+
+recon:
+  target: feature_recon
+  pixel_loss: mse
+  huber_delta: 1.0
+
+train:
+  steps: 1000
+  batch_size: 32
+  lambda_txt: 0.0
+  lambda_rec: 1.0
+  strategy: naive
+
+sweep:
+  mode: recon
+  lambda_values: [0.25, 0.5, 1.0, 2.0]
+  seeds: [42, 43]
+
+optim:
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+
+log:
+  every: 10
+  cos_every: 10
+  save_every: 200
+  eval_every: 200
+
+eval:
+  batch_size: 64
+  max_batches: 20
+  use_lpips: false

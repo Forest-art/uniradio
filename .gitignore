@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+runs/
+tmp_imagenet_dummy/
+
+*.log
+slurm-*.out
+slurm-*.err
+
+.DS_Store
