@@ -12,9 +12,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.utils import broadcast_object_list, set_seed
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
+from torchvision import transforms
 from tqdm import tqdm
+
+from .data_imagenet import build_imagenet_loader
 
 
 def seed_everything(seed: int) -> None:
@@ -95,17 +96,14 @@ def _summary_from_output(output, adaptor_name: Optional[str]):
         key = adaptor_name if adaptor_name else "backbone"
         if key not in output:
             raise KeyError(f"Output key '{key}' missing. Available keys: {list(output.keys())}")
-        feat = output[key].summary
-    else:
-        feat = output.summary
-    return feat
+        return output[key].summary
+    return output.summary
 
 
 @torch.no_grad()
 def _extract_feature_batch(model, images: torch.Tensor, adaptor_name: Optional[str]) -> torch.Tensor:
     out = model(images)
-    feat = _summary_from_output(out, adaptor_name)
-    return feat.float()
+    return _summary_from_output(out, adaptor_name).float()
 
 
 def _cycle(loader):
@@ -231,6 +229,18 @@ def maybe_run_knn(
     return obj[0]
 
 
+def _infer_num_classes(accelerator: Accelerator, train_classes, train_loader) -> int:
+    if len(train_classes) > 0:
+        return len(train_classes)
+
+    local_max = torch.tensor(0, device=accelerator.device, dtype=torch.int64)
+    for _, y in train_loader:
+        y = y.to(accelerator.device)
+        local_max = torch.maximum(local_max, y.max())
+    global_max = accelerator.reduce(local_max, reduction="max")
+    return int(global_max.item()) + 1
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate RADIO representation with accelerate multi-GPU linear probe")
     parser.add_argument(
@@ -238,7 +248,7 @@ def main():
         default=None,
         help="Path to local RADIO repo root (contains hubconf.py). Used by --use_local_lib.",
     )
-    parser.add_argument("--data_root", required=True, help="ImageNet root that contains train/ and val/")
+    parser.add_argument("--data_root", required=True, help="ImageNet root or HF load_from_disk path")
     parser.add_argument("--model_version", default="c-radio_v3-b", help="RADIO model version key or checkpoint path")
     parser.add_argument("--adaptor_name", default=None, help="Optional adaptor name, default uses backbone summary")
     parser.add_argument("--use_huggingface", action="store_true", help="Match RADIO official HF loading path")
@@ -254,6 +264,11 @@ def main():
 
     parser.add_argument("--train_split", default="train")
     parser.add_argument("--val_split", default="val")
+    parser.add_argument("--data_format", default="auto", choices=["auto", "imagefolder", "hf_disk"])
+    parser.add_argument("--hf_load_from_disk", default=None, help="HF dataset path saved by datasets.save_to_disk")
+    parser.add_argument("--hf_image_key", default="image")
+    parser.add_argument("--hf_label_key", default="label")
+
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--workers", type=int, default=8)
 
@@ -272,7 +287,6 @@ def main():
     args = parser.parse_args()
 
     accelerator = Accelerator(mixed_precision=args.mixed_precision)
-
     seed_everything(args.seed)
     set_seed(args.seed, device_specific=True)
 
@@ -284,42 +298,49 @@ def main():
     preprocessor = model.make_preprocessor_external() if hasattr(model, "make_preprocessor_external") else None
     transform = _build_transform(res, preprocessor=preprocessor)
 
-    train_dir = Path(args.data_root) / args.train_split
-    val_dir = Path(args.data_root) / args.val_split
-    if not train_dir.exists() or not val_dir.exists():
-        raise FileNotFoundError(
-            f"Expected directories not found: {train_dir} and/or {val_dir}. data_root must contain train/ and val/."
-        )
-
-    train_ds = datasets.ImageFolder(str(train_dir), transform=transform)
-    val_ds = datasets.ImageFolder(str(val_dir), transform=transform)
-    if train_ds.classes != val_ds.classes:
-        raise ValueError("train/val class folders mismatch")
-
-    num_classes = len(train_ds.classes)
-
-    train_loader = DataLoader(
-        train_ds,
+    train_loader, train_classes = build_imagenet_loader(
+        data_root=args.data_root,
+        split=args.train_split,
+        image_size=res[0],
         batch_size=args.batch_size,
+        num_workers=args.workers,
+        class_names_file=None,
         shuffle=True,
-        num_workers=args.workers,
-        pin_memory=True,
         drop_last=True,
+        data_format=args.data_format,
+        hf_load_from_disk=args.hf_load_from_disk,
+        hf_split_override=args.train_split,
+        hf_image_key=args.hf_image_key,
+        hf_label_key=args.hf_label_key,
+        custom_transform=transform,
     )
-    val_loader = DataLoader(
-        val_ds,
+    val_loader, val_classes = build_imagenet_loader(
+        data_root=args.data_root,
+        split=args.val_split,
+        image_size=res[0],
         batch_size=args.batch_size,
-        shuffle=False,
         num_workers=args.workers,
-        pin_memory=True,
+        class_names_file=None,
+        shuffle=False,
         drop_last=False,
+        data_format=args.data_format,
+        hf_load_from_disk=args.hf_load_from_disk,
+        hf_split_override=args.val_split,
+        hf_image_key=args.hf_image_key,
+        hf_label_key=args.hf_label_key,
+        custom_transform=transform,
     )
+
+    if train_classes and val_classes and train_classes != val_classes:
+        raise ValueError("train/val class names mismatch")
 
     model = accelerator.prepare_model(model, evaluation_mode=True)
 
     sample_batch = next(iter(train_loader))[0].to(accelerator.device)
     with torch.no_grad():
         feat_dim = int(_extract_feature_batch(model, sample_batch, args.adaptor_name).shape[-1])
+
+    num_classes = _infer_num_classes(accelerator, train_classes, train_loader)
 
     classifier = nn.Linear(feat_dim, num_classes).to(accelerator.device)
     optimizer = torch.optim.AdamW(classifier.parameters(), lr=args.linear_lr, weight_decay=args.linear_wd)
@@ -375,11 +396,13 @@ def main():
         "use_huggingface": bool(args.use_huggingface),
         "use_local_lib": bool(args.use_local_lib),
         "torchhub_repo": args.torchhub_repo,
+        "data_format": args.data_format,
+        "hf_load_from_disk": args.hf_load_from_disk,
         "resolution": list(res),
         "feature_dim": feat_dim,
         "num_classes": num_classes,
-        "train_samples": int(len(train_ds)),
-        "val_samples": int(len(val_ds)),
+        "train_samples": int(len(train_loader.dataset)),
+        "val_samples": int(len(val_loader.dataset)),
         "k": int(args.k),
         "run_knn": bool(args.run_knn),
         "knn_top1": knn_acc,

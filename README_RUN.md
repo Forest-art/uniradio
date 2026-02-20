@@ -9,6 +9,10 @@ pip install -r requirements.txt
 ## 2) 配置 ImageNet 与 RADIO
 编辑 `configs/smoke.yaml`（以及 sweep 配置）中的以下字段：
 - `data.data_root`: ImageNet 根目录（应至少包含 `train/` 和 `val/`）
+- `data.data_format`: `auto` / `imagefolder` / `hf_disk`
+- `data.hf_load_from_disk`: 若使用 HuggingFace `datasets.load_from_disk`，填本地数据路径
+- `data.hf_split_train` / `data.hf_split_val`: HF split 名（通常 `train` / `validation`）
+- `data.hf_image_key` / `data.hf_label_key`: HF 样本字段名（默认 `image` / `label`）
 - `radio.code_root`: RADIO 代码目录（例如 `/project/peilab/luxiaocheng/projects/RADIO`）
 - `radio.ckpt`: RADIO 权重路径（例如 `radio_v2.1_bf16.pth.tar`）
 - 可选 `data.class_names_file`: 一行一个类名，用于替换默认文件夹名 prompt
@@ -140,6 +144,25 @@ python -m accelerate.commands.launch --num_processes 8 -m unirae.eval_radio_repr
   --workers 8 \
   --linear_steps 2000 \
   --output runs/radio_repr/c-radio_v3-b_lp_8gpu.json
+```
+
+如果数据是 `datasets.save_to_disk` 格式（参考 RAE 的 load_from_disk）：
+```bash
+python -m accelerate.commands.launch --num_processes 8 -m unirae.eval_radio_repr \
+  --no_use_local_lib \
+  --torchhub_repo NVlabs/RADIO \
+  --data_root /path/to/hf_imagenet_disk \
+  --data_format hf_disk \
+  --hf_load_from_disk /path/to/hf_imagenet_disk \
+  --train_split train \
+  --val_split validation \
+  --hf_image_key image \
+  --hf_label_key label \
+  --model_version c-radio_v3-b \
+  --batch_size 256 \
+  --workers 8 \
+  --linear_steps 2000 \
+  --output runs/radio_repr/c-radio_v3-b_lp_8gpu_hf.json
 ```
 
 加载逻辑（已对齐 RADIO 官方 `examples/common/model_loader.py` 的 RADIO 分支）：

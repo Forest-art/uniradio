@@ -5,6 +5,7 @@ __pycache__/
 
 runs/
 tmp_imagenet_dummy/
+tmp_hf_imagenet_disk/
 
 *.log
 slurm-*.out

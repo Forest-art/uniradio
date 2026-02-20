@@ -9,6 +9,12 @@ output:
 
 data:
   data_root: /path/to/imagenet
+  data_format: auto        # auto | imagefolder | hf_disk
+  hf_load_from_disk: null  # e.g. /path/to/imagenet_hf_saved
+  hf_split_train: train
+  hf_split_val: validation
+  hf_image_key: image
+  hf_label_key: label
   class_names_file: null
   image_size: 224
   num_workers: 8

@@ -117,6 +117,11 @@ def main() -> None:
         class_names_file=cfg["data"].get("class_names_file"),
         shuffle=False,
         drop_last=False,
+        data_format=cfg["data"].get("data_format", "auto"),
+        hf_load_from_disk=cfg["data"].get("hf_load_from_disk"),
+        hf_split_override=cfg["data"].get("hf_split_val"),
+        hf_image_key=cfg["data"].get("hf_image_key", "image"),
+        hf_label_key=cfg["data"].get("hf_label_key", "label"),
     )
 
     model = RadioWrapper(cfg).to(device)

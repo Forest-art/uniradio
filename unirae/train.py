@@ -185,25 +185,37 @@ def main() -> None:
     run_dir, ckpt_dir = objs[0], objs[1]
     accelerator.wait_for_everyone()
 
+    data_cfg = cfg["data"]
+
     train_loader, class_names = build_imagenet_loader(
-        data_root=cfg["data"]["data_root"],
+        data_root=data_cfg["data_root"],
         split="train",
-        image_size=int(cfg["data"].get("image_size", 224)),
+        image_size=int(data_cfg.get("image_size", 224)),
         batch_size=int(cfg["train"].get("batch_size", 32)),
-        num_workers=int(cfg["data"].get("num_workers", 8)),
-        class_names_file=cfg["data"].get("class_names_file"),
+        num_workers=int(data_cfg.get("num_workers", 8)),
+        class_names_file=data_cfg.get("class_names_file"),
         shuffle=True,
         drop_last=True,
+        data_format=data_cfg.get("data_format", "auto"),
+        hf_load_from_disk=data_cfg.get("hf_load_from_disk"),
+        hf_split_override=data_cfg.get("hf_split_train"),
+        hf_image_key=data_cfg.get("hf_image_key", "image"),
+        hf_label_key=data_cfg.get("hf_label_key", "label"),
     )
     val_loader, _ = build_imagenet_loader(
-        data_root=cfg["data"]["data_root"],
+        data_root=data_cfg["data_root"],
         split="val",
-        image_size=int(cfg["data"].get("image_size", 224)),
+        image_size=int(data_cfg.get("image_size", 224)),
         batch_size=int(cfg["eval"].get("batch_size", cfg["train"].get("batch_size", 32))),
-        num_workers=int(cfg["data"].get("num_workers", 8)),
-        class_names_file=cfg["data"].get("class_names_file"),
+        num_workers=int(data_cfg.get("num_workers", 8)),
+        class_names_file=data_cfg.get("class_names_file"),
         shuffle=False,
         drop_last=False,
+        data_format=data_cfg.get("data_format", "auto"),
+        hf_load_from_disk=data_cfg.get("hf_load_from_disk"),
+        hf_split_override=data_cfg.get("hf_split_val"),
+        hf_image_key=data_cfg.get("hf_image_key", "image"),
+        hf_label_key=data_cfg.get("hf_label_key", "label"),
     )
 
     model = RadioWrapper(cfg).to(device)
