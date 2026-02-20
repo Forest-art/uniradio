@@ -15,7 +15,18 @@ from accelerate.utils import broadcast_object_list, set_seed
 from torchvision import transforms
 from tqdm import tqdm
 
-from .data_imagenet import build_imagenet_loader
+try:
+    # Preferred when running as a package module: python -m unirae.eval_radio_repr
+    from .data_imagenet import build_imagenet_loader
+except ImportError:
+    # Fallback when running as a script: python unirae/eval_radio_repr.py
+    import sys
+    from pathlib import Path
+
+    _ROOT = Path(__file__).resolve().parents[1]
+    if str(_ROOT) not in sys.path:
+        sys.path.insert(0, str(_ROOT))
+    from unirae.data_imagenet import build_imagenet_loader
 
 
 def seed_everything(seed: int) -> None:
@@ -38,6 +49,15 @@ def _load_radio_model(args, device: torch.device):
             "This script is for RADIO checkpoints/versions."
         )
 
+    def _raise_version_error(err: Exception, repo_hint: str):
+        msg = (
+            f"Failed to load model_version='{args.model_version}' from {repo_hint}. "
+            "This is usually a RADIO version-map mismatch, not a dataset loading issue. "
+            "Try one of: 1) update RADIO repo/checkpoint, 2) pass a local ckpt path to --model_version, "
+            "3) use a known version like 'radio_v2' for this repo."
+        )
+        raise ValueError(msg) from err
+
     if args.use_huggingface:
         from transformers import AutoConfig, AutoModel
 
@@ -57,24 +77,30 @@ def _load_radio_model(args, device: torch.device):
             raise ValueError("When --use_local_lib, provide --radio_code_root or local --torchhub_repo path.")
         if not (Path(local_repo) / "hubconf.py").exists():
             raise FileNotFoundError(f"Local RADIO repo must contain hubconf.py: {local_repo}")
-        model = torch.hub.load(
-            local_repo,
-            "radio_model",
-            source="local",
-            trust_repo=True,
-            progress=True,
-            force_reload=args.force_reload,
-            **kwargs,
-        )
+        try:
+            model = torch.hub.load(
+                local_repo,
+                "radio_model",
+                source="local",
+                trust_repo=True,
+                progress=True,
+                force_reload=args.force_reload,
+                **kwargs,
+            )
+        except (KeyError, ValueError) as e:
+            _raise_version_error(e, f"local repo '{local_repo}'")
     else:
-        model = torch.hub.load(
-            args.torchhub_repo,
-            "radio_model",
-            progress=True,
-            force_reload=args.force_reload,
-            trust_repo=True,
-            **kwargs,
-        )
+        try:
+            model = torch.hub.load(
+                args.torchhub_repo,
+                "radio_model",
+                progress=True,
+                force_reload=args.force_reload,
+                trust_repo=True,
+                **kwargs,
+            )
+        except (KeyError, ValueError) as e:
+            _raise_version_error(e, f"torchhub repo '{args.torchhub_repo}'")
 
     model = model.to(device).eval()
     return model
