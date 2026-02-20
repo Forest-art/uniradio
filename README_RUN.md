@@ -118,7 +118,7 @@ python -u -m unirae.analyze_tradeoff --runs_root runs --out_dir runs/analysis
 ### 7.1 本地/交互式直接跑
 ```bash
 cd /project/peilab/luxiaocheng/projects/unirae_radio
-python -u -m unirae.eval_radio_repr \
+python -m accelerate.commands.launch --num_processes 1 -m unirae.eval_radio_repr \
   --radio_code_root /path/to/RADIO \
   --data_root /path/to/imagenet \
   --model_version radio_v2 \
@@ -127,6 +127,19 @@ python -u -m unirae.eval_radio_repr \
   --k 20 \
   --linear_steps 2000 \
   --output runs/radio_repr/radio_v2_repr.json
+```
+
+8 卡 linear probing（单机）：
+```bash
+python -m accelerate.commands.launch --num_processes 8 -m unirae.eval_radio_repr \
+  --no_use_local_lib \
+  --torchhub_repo NVlabs/RADIO \
+  --data_root /path/to/imagenet \
+  --model_version radio_v2 \
+  --batch_size 256 \
+  --workers 8 \
+  --linear_steps 2000 \
+  --output runs/radio_repr/radio_v2_lp_8gpu.json
 ```
 
 加载逻辑（已对齐 RADIO 官方 `examples/common/model_loader.py` 的 RADIO 分支）：
@@ -143,20 +156,20 @@ python -u -m unirae.eval_radio_repr \
 
 输出 JSON 包含：
 - `feature_dim`
-- `knn_top1`
 - `linear_probe_top1`
-- `feature_mean` / `feature_std`
+- `world_size`
+- `knn_top1`（仅当加 `--run_knn`）
 
 ### 7.2 Slurm 一条命令（按你集群参数改 account/partition）
 ```bash
-srun --account=<your_account> --partition=<your_partition> --nodes=1 --gpus-per-node=1 --cpus-per-task=8 --mem=32G --time=0-02:00:00 \
+srun --account=<your_account> --partition=<your_partition> --nodes=1 --gpus-per-node=8 --cpus-per-task=32 --mem=128G --time=0-02:00:00 \
   bash -lc 'source ~/anaconda3/etc/profile.d/conda.sh && conda activate <your_env> && \
   cd /project/peilab/luxiaocheng/projects/unirae_radio && \
-  python -u -m unirae.eval_radio_repr \
-    --radio_code_root /path/to/RADIO \
+  python -m accelerate.commands.launch --num_processes 8 -m unirae.eval_radio_repr \
+    --no_use_local_lib --torchhub_repo NVlabs/RADIO \
     --data_root /path/to/imagenet \
     --model_version radio_v2 \
-    --batch_size 256 --workers 8 --k 20 --linear_steps 2000 \
+    --batch_size 256 --workers 8 --linear_steps 2000 \
     --output runs/radio_repr/radio_v2_repr.json'
 ```
 
