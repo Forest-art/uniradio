@@ -135,6 +135,13 @@ class RadioWrapper(nn.Module):
                 "z_dino": z_dino,
             }
 
+        # Some launch modes can leave RADIO input_conditioner buffers on CPU.
+        # Align them to the current image device right before forward.
+        conditioner = getattr(self.radio, "input_conditioner", None)
+        if conditioner is not None and hasattr(conditioner, "norm_mean"):
+            if conditioner.norm_mean.device != images.device:
+                conditioner.to(images.device)
+
         out = self.radio(images, feature_fmt="NLC")
         z_clip = out[self.clip_key].summary
         z_dino = out[self.dino_key].features

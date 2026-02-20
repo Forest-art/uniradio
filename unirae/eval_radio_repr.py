@@ -128,6 +128,11 @@ def _summary_from_output(output, adaptor_name: Optional[str]):
 
 @torch.no_grad()
 def _extract_feature_batch(model, images: torch.Tensor, adaptor_name: Optional[str]) -> torch.Tensor:
+    mod = model.module if hasattr(model, "module") else model
+    conditioner = getattr(mod, "input_conditioner", None)
+    if conditioner is not None and hasattr(conditioner, "norm_mean"):
+        if conditioner.norm_mean.device != images.device:
+            conditioner.to(images.device)
     out = model(images)
     return _summary_from_output(out, adaptor_name).float()
 
