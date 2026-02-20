@@ -121,12 +121,12 @@ cd /project/peilab/luxiaocheng/projects/unirae_radio
 python -m accelerate.commands.launch --num_processes 1 -m unirae.eval_radio_repr \
   --radio_code_root /path/to/RADIO \
   --data_root /path/to/imagenet \
-  --model_version radio_v2 \
+  --model_version c-radio_v3-b \
   --batch_size 128 \
   --workers 8 \
   --k 20 \
   --linear_steps 2000 \
-  --output runs/radio_repr/radio_v2_repr.json
+  --output runs/radio_repr/c-radio_v3-b_repr.json
 ```
 
 8 卡 linear probing（单机）：
@@ -135,20 +135,31 @@ python -m accelerate.commands.launch --num_processes 8 -m unirae.eval_radio_repr
   --no_use_local_lib \
   --torchhub_repo NVlabs/RADIO \
   --data_root /path/to/imagenet \
-  --model_version radio_v2 \
+  --model_version c-radio_v3-b \
   --batch_size 256 \
   --workers 8 \
   --linear_steps 2000 \
-  --output runs/radio_repr/radio_v2_lp_8gpu.json
+  --output runs/radio_repr/c-radio_v3-b_lp_8gpu.json
 ```
 
 加载逻辑（已对齐 RADIO 官方 `examples/common/model_loader.py` 的 RADIO 分支）：
-- 默认：`--use_local_lib`（默认开启）时调用 `radio_code_root/hubconf.py` 里的 `radio_model(...)`
+- 默认：`--use_local_lib`（默认开启）时调用：
+  - `torch.hub.load(<local_repo>, "radio_model", source="local", trust_repo=True, version=...)`
+  - 其中 `<local_repo>` 优先取 `--radio_code_root`，否则取 `--torchhub_repo`（本地路径）
 - 可选：`--use_huggingface` 走 HF 加载
-- 可选：`--no_use_local_lib` 走 `torch.hub.load(...)`
+- 可选：`--no_use_local_lib` 走远端 `torch.hub.load(...)`
 - `--model_version` 同时支持：
-  - 版本名（如 `radio_v2`）
+  - 版本名（如 `c-radio_v3-b`）
   - 本地模型路径（如 `/path/to/radio_ckpt.pth.tar`）
+
+按你习惯的本地加载写法可直接这样：
+```bash
+python -m accelerate.commands.launch --num_processes 1 -m unirae.eval_radio_repr \
+  --use_local_lib \
+  --torchhub_repo /path/to/RADIO \
+  --data_root /path/to/imagenet \
+  --model_version c-radio_v3-b
+```
 
 输入数据目录要求：
 - `/path/to/imagenet/train/...`
@@ -168,9 +179,9 @@ srun --account=<your_account> --partition=<your_partition> --nodes=1 --gpus-per-
   python -m accelerate.commands.launch --num_processes 8 -m unirae.eval_radio_repr \
     --no_use_local_lib --torchhub_repo NVlabs/RADIO \
     --data_root /path/to/imagenet \
-    --model_version radio_v2 \
+    --model_version c-radio_v3-b \
     --batch_size 256 --workers 8 --linear_steps 2000 \
-    --output runs/radio_repr/radio_v2_repr.json'
+    --output runs/radio_repr/c-radio_v3-b_repr.json'
 ```
 
 ## 8) 常见错误排查

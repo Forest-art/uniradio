@@ -2,7 +2,6 @@ import argparse
 import json
 import os
 import random
-import sys
 from collections import Counter
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -23,14 +22,6 @@ def seed_everything(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
-
-def _prepare_radio_import(radio_code_root: str) -> None:
-    root = Path(radio_code_root)
-    if not (root / "hubconf.py").exists():
-        raise FileNotFoundError(f"Cannot find hubconf.py in radio_code_root={radio_code_root}")
-    if str(root) not in sys.path:
-        sys.path.insert(0, str(root))
 
 
 def _load_radio_model(args, device: torch.device):
@@ -60,18 +51,27 @@ def _load_radio_model(args, device: torch.device):
         )
         model = AutoModel.from_pretrained(hf_repo, config=config, trust_remote_code=True)
     elif args.use_local_lib:
-        if not args.radio_code_root:
-            raise ValueError("--radio_code_root is required when --use_local_lib is enabled.")
-        _prepare_radio_import(args.radio_code_root)
-        from hubconf import radio_model
-
-        model = radio_model(**kwargs)
+        local_repo = args.radio_code_root or args.torchhub_repo
+        if not local_repo:
+            raise ValueError("When --use_local_lib, provide --radio_code_root or local --torchhub_repo path.")
+        if not (Path(local_repo) / "hubconf.py").exists():
+            raise FileNotFoundError(f"Local RADIO repo must contain hubconf.py: {local_repo}")
+        model = torch.hub.load(
+            local_repo,
+            "radio_model",
+            source="local",
+            trust_repo=True,
+            progress=True,
+            force_reload=args.force_reload,
+            **kwargs,
+        )
     else:
         model = torch.hub.load(
             args.torchhub_repo,
             "radio_model",
             progress=True,
             force_reload=args.force_reload,
+            trust_repo=True,
             **kwargs,
         )
 
@@ -236,15 +236,19 @@ def main():
     parser.add_argument(
         "--radio_code_root",
         default=None,
-        help="Path to RADIO repo root (contains hubconf.py). Required when --use_local_lib.",
+        help="Path to local RADIO repo root (contains hubconf.py). Used by --use_local_lib.",
     )
     parser.add_argument("--data_root", required=True, help="ImageNet root that contains train/ and val/")
-    parser.add_argument("--model_version", default="radio_v2", help="RADIO model version key or checkpoint path")
+    parser.add_argument("--model_version", default="c-radio_v3-b", help="RADIO model version key or checkpoint path")
     parser.add_argument("--adaptor_name", default=None, help="Optional adaptor name, default uses backbone summary")
     parser.add_argument("--use_huggingface", action="store_true", help="Match RADIO official HF loading path")
     parser.add_argument("--use_local_lib", dest="use_local_lib", action="store_true", default=True)
     parser.add_argument("--no_use_local_lib", dest="use_local_lib", action="store_false")
-    parser.add_argument("--torchhub_repo", default="NVlabs/RADIO", help="Used when --no_use_local_lib")
+    parser.add_argument(
+        "--torchhub_repo",
+        default="NVlabs/RADIO",
+        help="TorchHub repo. With --use_local_lib this can also be a local RADIO repo path.",
+    )
     parser.add_argument("--force_reload", action="store_true", help="torch.hub force reload")
     parser.add_argument("--vitdet_window_size", type=int, default=None)
 

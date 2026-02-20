@@ -1,7 +1,4 @@
 import importlib
-import importlib.util
-import os
-import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -62,25 +59,6 @@ class RadioWrapper(nn.Module):
             for p in self.lora_params:
                 p.requires_grad = True
 
-    def _import_hubconf(self, code_root: str):
-        code_root = str(code_root)
-        hubconf_path = Path(code_root) / "hubconf.py"
-        if not hubconf_path.exists():
-            raise FileNotFoundError(f"RADIO hubconf not found at: {hubconf_path}")
-
-        radio_pkg = Path(code_root) / "radio"
-        if radio_pkg.exists() and code_root not in sys.path:
-            sys.path.insert(0, code_root)
-
-        module_name = f"unirae_radio_hubconf_{abs(hash(code_root))}"
-        spec = importlib.util.spec_from_file_location(module_name, str(hubconf_path))
-        if spec is None or spec.loader is None:
-            raise RuntimeError(f"Failed to import hubconf from {hubconf_path}")
-
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        return mod
-
     def _build_radio_model(self, radio_cfg: Dict) -> None:
         code_root = radio_cfg.get("code_root")
         ckpt = radio_cfg.get("ckpt", "")
@@ -91,8 +69,17 @@ class RadioWrapper(nn.Module):
 
         try:
             if code_root:
-                hub_mod = self._import_hubconf(code_root)
-                self.radio = hub_mod.radio_model(version=ckpt, adaptor_names=adaptor_names)
+                if not (Path(code_root) / "hubconf.py").exists():
+                    raise FileNotFoundError(f"RADIO hubconf not found at: {Path(code_root) / 'hubconf.py'}")
+                # Align with local torch.hub loading style.
+                self.radio = torch.hub.load(
+                    str(code_root),
+                    "radio_model",
+                    source="local",
+                    trust_repo=True,
+                    version=ckpt,
+                    adaptor_names=adaptor_names,
+                )
             else:
                 # Optional fallback to installed hubconf module.
                 hub_mod = importlib.import_module("hubconf")
