@@ -1,0 +1,89 @@
+seed: 42
+
+experiment:
+  name: cifar10_joint_conflict
+  group: joint_conflict
+
+output:
+  root: runs
+
+data:
+  dataset: cifar10
+  root: /path/to/cifar10
+  image_size: 32
+  batch_size: 128
+  num_workers: 8
+  download: true
+  val_from_train: false
+  val_ratio: 0.1
+  use_fake_data: false
+  fake_train_size: 4096
+  fake_eval_size: 1024
+
+model:
+  backbone: resnet18
+  pretrained: false
+  freeze_backbone: false
+  txt_dim: 256
+  rec_dim: 256
+  decoder_hidden_dim: 512
+  recon_size: 32
+
+text:
+  prompt_templates:
+    - "a photo of a {class}"
+  temperature: 0.07
+
+train:
+  mode: joint
+  steps: 1000
+  lambda_txt: 1.0
+  lambda_rec: 1.0
+  lambda_cons: 0.0
+  lambda_sup: 0.0
+  strategy: conflict_aware
+  shared_params: backbone
+
+optim:
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+
+log:
+  every: 20
+  cos_every: 20
+  save_every: 200
+  eval_every: 200
+
+eval:
+  split: test
+  batch_size: 256
+  max_batches: 50
+  save_recon_samples: true
+  sample_images: 8
+
+consistency:
+  enabled: false
+  two_view: false
+  aug_strength: medium
+  target: txt_head
+  loss_type: cosine
+  lambda_cons: 0.1
+  merge_into_understanding: true
+  recon_target_source: view1
+
+supcon:
+  enabled: false
+  two_view: true
+  aug: medium
+  lambda: 0.5
+  tau: 0.1
+  embed: txt
+  merge_into_understanding: true
+
+sweep:
+  mode: joint_conflict
+  lambda_values: [0.25, 0.5, 1.0, 2.0]
+  seeds: [42, 43]
+
+accelerate:
+  mixed_precision: "no"

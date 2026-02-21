@@ -163,6 +163,9 @@ def main() -> None:
     cfg = apply_overrides(base_cfg, args.set)
 
     mixed_precision = cfg.get("accelerate", {}).get("mixed_precision", "no")
+    if isinstance(mixed_precision, bool):
+        mixed_precision = "no" if mixed_precision is False else "fp16"
+    mixed_precision = str(mixed_precision)
     accelerator = Accelerator(mixed_precision=mixed_precision)
     device = accelerator.device
 
