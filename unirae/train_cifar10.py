@@ -325,6 +325,17 @@ def _resolve_training_mode(cfg: Dict) -> Tuple[str, int, float, float, str]:
     )
 
 
+def _resolve_text_warmup_steps(cfg: Dict, mode: str, total_steps: int) -> int:
+    if mode != "joint":
+        return 0
+    train_cfg = cfg.get("train", {})
+    warmup_steps = int(train_cfg.get("text_warmup_steps", train_cfg.get("warmup_text_steps", 0)))
+    warmup_steps = max(0, warmup_steps)
+    if total_steps > 0:
+        warmup_steps = min(warmup_steps, total_steps)
+    return warmup_steps
+
+
 def _resolve_grad_norm_mode(cfg: Dict, mode: str) -> str:
     train_cfg = cfg.get("train", {})
     raw = train_cfg.get("grad_norm_mode", train_cfg.get("grad_norm", "none"))
@@ -565,6 +576,7 @@ def main() -> None:
     model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
 
     mode, steps, lambda_txt, lambda_rec, strategy = _resolve_training_mode(cfg)
+    text_warmup_steps = _resolve_text_warmup_steps(cfg, mode=mode, total_steps=steps)
     grad_norm_mode = _resolve_grad_norm_mode(cfg, mode=mode)
     train_cfg = cfg.get("train", {})
     cagrad_beta = float(cfg.get("train", {}).get("cagrad_beta", 0.5))
@@ -605,6 +617,7 @@ def main() -> None:
                 "strategy": strategy,
                 "backbone": backbone_name,
                 "mode": mode,
+                "text_warmup_steps": text_warmup_steps,
                 "lambda_txt": lambda_txt,
                 "lambda_rec": lambda_rec,
                 "cagrad_beta": cagrad_beta,
@@ -671,53 +684,22 @@ def main() -> None:
 
         optimizer.zero_grad(set_to_none=True)
         cos = 0.0
-        if strategy == "pcgrad":
-            cos = apply_conflict_aware(
-                loss_txt=Lu,
-                loss_rec=Lg,
-                lora_params=shared_params,
-                aux_params=aux_params,
-                lambda_txt=lambda_txt,
-                lambda_rec=lambda_rec,
-                grad_norm_mode=grad_norm_mode,
-                grad_norm_indices=grad_norm_indices,
-                grad_norm_conflict_only=grad_norm_conflict_only,
-                extra_loss=None,
-            )
-            if accelerator.num_processes > 1:
-                for p in list(shared_params) + list(aux_params):
-                    if p.grad is not None:
-                        p.grad = accelerator.reduce(p.grad, reduction="mean")
-            optimizer.step()
-        elif strategy == "cagrad":
-            cos = apply_cagrad(
-                loss_txt=Lu,
-                loss_rec=Lg,
-                shared_params=shared_params,
-                aux_params=aux_params,
-                lambda_txt=lambda_txt,
-                lambda_rec=lambda_rec,
-                beta=cagrad_beta,
-                conflict_only=cagrad_conflict_only,
-                conflict_threshold=cagrad_conflict_threshold,
-                nonconflict_merge=cagrad_nonconflict_merge,
-                grad_norm_mode=grad_norm_mode,
-                grad_norm_indices=grad_norm_indices,
-                grad_norm_conflict_only=grad_norm_conflict_only,
-                extra_loss=None,
-            )
-            if accelerator.num_processes > 1:
-                for p in list(shared_params) + list(aux_params):
-                    if p.grad is not None:
-                        p.grad = accelerator.reduce(p.grad, reduction="mean")
+        in_text_warmup = (mode == "joint") and (step <= text_warmup_steps)
+        loss_total_step = total
+        phase = "text_warmup" if in_text_warmup else "joint"
+
+        if in_text_warmup:
+            loss_total_step = lambda_txt * Lu
+            if step % cos_every == 0 and len(shared_params) > 0:
+                cos = compute_grad_cosine(Lu, Lg, shared_params)
+            accelerator.backward(loss_total_step)
             optimizer.step()
         else:
-            manual_naive = (mode == "joint") and (grad_norm_mode != "none") and (len(shared_params) > 0)
-            if manual_naive:
-                cos = apply_naive(
+            if strategy == "pcgrad":
+                cos = apply_conflict_aware(
                     loss_txt=Lu,
                     loss_rec=Lg,
-                    shared_params=shared_params,
+                    lora_params=shared_params,
                     aux_params=aux_params,
                     lambda_txt=lambda_txt,
                     lambda_rec=lambda_rec,
@@ -731,16 +713,58 @@ def main() -> None:
                         if p.grad is not None:
                             p.grad = accelerator.reduce(p.grad, reduction="mean")
                 optimizer.step()
-            else:
-                if step % cos_every == 0 and len(shared_params) > 0:
-                    cos = compute_grad_cosine(Lu, Lg, shared_params)
-                accelerator.backward(total)
+            elif strategy == "cagrad":
+                cos = apply_cagrad(
+                    loss_txt=Lu,
+                    loss_rec=Lg,
+                    shared_params=shared_params,
+                    aux_params=aux_params,
+                    lambda_txt=lambda_txt,
+                    lambda_rec=lambda_rec,
+                    beta=cagrad_beta,
+                    conflict_only=cagrad_conflict_only,
+                    conflict_threshold=cagrad_conflict_threshold,
+                    nonconflict_merge=cagrad_nonconflict_merge,
+                    grad_norm_mode=grad_norm_mode,
+                    grad_norm_indices=grad_norm_indices,
+                    grad_norm_conflict_only=grad_norm_conflict_only,
+                    extra_loss=None,
+                )
+                if accelerator.num_processes > 1:
+                    for p in list(shared_params) + list(aux_params):
+                        if p.grad is not None:
+                            p.grad = accelerator.reduce(p.grad, reduction="mean")
                 optimizer.step()
+            else:
+                manual_naive = (mode == "joint") and (grad_norm_mode != "none") and (len(shared_params) > 0)
+                if manual_naive:
+                    cos = apply_naive(
+                        loss_txt=Lu,
+                        loss_rec=Lg,
+                        shared_params=shared_params,
+                        aux_params=aux_params,
+                        lambda_txt=lambda_txt,
+                        lambda_rec=lambda_rec,
+                        grad_norm_mode=grad_norm_mode,
+                        grad_norm_indices=grad_norm_indices,
+                        grad_norm_conflict_only=grad_norm_conflict_only,
+                        extra_loss=None,
+                    )
+                    if accelerator.num_processes > 1:
+                        for p in list(shared_params) + list(aux_params):
+                            if p.grad is not None:
+                                p.grad = accelerator.reduce(p.grad, reduction="mean")
+                    optimizer.step()
+                else:
+                    if step % cos_every == 0 and len(shared_params) > 0:
+                        cos = compute_grad_cosine(Lu, Lg, shared_params)
+                    accelerator.backward(total)
+                    optimizer.step()
 
         cos_global = _dist_mean_scalar(accelerator, cos, device)
         Lu_global = _dist_mean_scalar(accelerator, Lu, device)
         Lg_global = _dist_mean_scalar(accelerator, Lg, device)
-        total_global = _dist_mean_scalar(accelerator, total, device)
+        total_global = _dist_mean_scalar(accelerator, loss_total_step, device)
         txt_acc_global = _dist_mean_scalar(accelerator, txt_extra.get("txt_acc", 0.0), device)
 
         if step % cos_every == 0 and accelerator.is_main_process:
@@ -759,6 +783,7 @@ def main() -> None:
             "recon_mse": Lg_global,
             "strategy": strategy,
             "mode": mode,
+            "phase": phase,
         }
 
         if accelerator.is_main_process and (step % log_every == 0 or step == 1 or step == steps):
@@ -815,6 +840,7 @@ def main() -> None:
             "strategy": strategy,
             "grad_strategy": strategy,
             "mode": mode,
+            "text_warmup_steps": text_warmup_steps,
             "seed": seed,
             "lambda_txt": lambda_txt,
             "lambda_rec": lambda_rec,
