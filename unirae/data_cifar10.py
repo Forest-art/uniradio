@@ -20,6 +20,32 @@ CIFAR10_CLASS_NAMES = [
 
 CIFAR10_MEAN = [0.4914, 0.4822, 0.4465]
 CIFAR10_STD = [0.2470, 0.2435, 0.2616]
+CIFAR100_MEAN = [0.5071, 0.4867, 0.4408]
+CIFAR100_STD = [0.2675, 0.2565, 0.2761]
+
+
+def _normalize_dataset_name(dataset: str) -> str:
+    d = str(dataset).lower()
+    if d in {"cifar10", "cifar100"}:
+        return d
+    raise ValueError(f"Unsupported dataset={dataset}. Use cifar10|cifar100.")
+
+
+def _dataset_stats(dataset: str) -> Tuple[List[float], List[float]]:
+    d = _normalize_dataset_name(dataset)
+    if d == "cifar100":
+        return CIFAR100_MEAN, CIFAR100_STD
+    return CIFAR10_MEAN, CIFAR10_STD
+
+
+def _dataset_num_classes(dataset: str) -> int:
+    d = _normalize_dataset_name(dataset)
+    return 100 if d == "cifar100" else 10
+
+
+def _dataset_torchvision_cls(dataset: str):
+    d = _normalize_dataset_name(dataset)
+    return datasets.CIFAR100 if d == "cifar100" else datasets.CIFAR10
 
 
 def _resize_ops(image_size: int) -> List:
@@ -32,7 +58,9 @@ def build_cifar10_transforms(
     image_size: int,
     split: str,
     aug_strength: str = "medium",
+    dataset: str = "cifar10",
 ) -> transforms.Compose:
+    mean, std = _dataset_stats(dataset)
     resize_ops = []
     if image_size != 32:
         resize_ops = _resize_ops(image_size)
@@ -61,7 +89,7 @@ def build_cifar10_transforms(
             + resize_ops
             + [
                 transforms.ToTensor(),
-                transforms.Normalize(CIFAR10_MEAN, CIFAR10_STD),
+                transforms.Normalize(mean, std),
             ]
         )
 
@@ -69,7 +97,7 @@ def build_cifar10_transforms(
         resize_ops
         + [
             transforms.ToTensor(),
-            transforms.Normalize(CIFAR10_MEAN, CIFAR10_STD),
+            transforms.Normalize(mean, std),
         ]
     )
 
@@ -77,10 +105,11 @@ def build_cifar10_transforms(
 def build_cifar10_multi_view_transforms(
     image_size: int,
     aug_strength: str = "medium",
+    dataset: str = "cifar10",
 ) -> Tuple[transforms.Compose, transforms.Compose, transforms.Compose]:
-    view1 = build_cifar10_transforms(image_size=image_size, split="train", aug_strength=aug_strength)
-    view2 = build_cifar10_transforms(image_size=image_size, split="train", aug_strength=aug_strength)
-    target = build_cifar10_transforms(image_size=image_size, split="test", aug_strength=aug_strength)
+    view1 = build_cifar10_transforms(dataset=dataset, image_size=image_size, split="train", aug_strength=aug_strength)
+    view2 = build_cifar10_transforms(dataset=dataset, image_size=image_size, split="train", aug_strength=aug_strength)
+    target = build_cifar10_transforms(dataset=dataset, image_size=image_size, split="test", aug_strength=aug_strength)
     return view1, view2, target
 
 
@@ -139,15 +168,32 @@ def _build_fake_dataset(
     image_size: int,
     size_train: int,
     size_eval: int,
+    num_classes: int,
     transform=None,
 ) -> Dataset:
     size = size_train if split == "train" else size_eval
     return datasets.FakeData(
         size=size,
         image_size=(3, image_size, image_size),
-        num_classes=10,
+        num_classes=num_classes,
         transform=transform,
     )
+
+
+def _extract_class_names(ds: Dataset, num_classes: int) -> List[str]:
+    base = ds
+    if isinstance(base, Subset):
+        base = base.dataset
+    if hasattr(base, "base_dataset"):
+        base = base.base_dataset
+
+    classes = getattr(base, "classes", None)
+    if isinstance(classes, list) and len(classes) == num_classes:
+        return [str(x) for x in classes]
+
+    if num_classes == len(CIFAR10_CLASS_NAMES):
+        return list(CIFAR10_CLASS_NAMES)
+    return [f"class_{i}" for i in range(num_classes)]
 
 
 def build_cifar10_dataset(
@@ -165,12 +211,18 @@ def build_cifar10_dataset(
     two_view: bool = False,
     aug_strength: str = "medium",
     target_source: str = "view1",
+    dataset: str = "cifar10",
 ) -> Tuple[Dataset, List[str]]:
+    dataset_name = _normalize_dataset_name(dataset)
+    num_classes = _dataset_num_classes(dataset_name)
+    dataset_cls = _dataset_torchvision_cls(dataset_name)
+
     split = split.lower()
     if split not in {"train", "val", "test"}:
         raise ValueError(f"Unsupported split={split}, expected train|val|test")
 
     tfm = custom_transform if custom_transform is not None else build_cifar10_transforms(
+        dataset=dataset_name,
         image_size=image_size,
         split=split,
         aug_strength=aug_strength,
@@ -182,10 +234,12 @@ def build_cifar10_dataset(
             image_size=image_size,
             size_train=fake_train_size,
             size_eval=fake_eval_size,
+            num_classes=num_classes,
             transform=None if (split == "train" and two_view) else tfm,
         )
         if split == "train" and two_view:
             view1_tfm, view2_tfm, target_tfm = build_cifar10_multi_view_transforms(
+                dataset=dataset_name,
                 image_size=image_size,
                 aug_strength=aug_strength,
             )
@@ -198,14 +252,15 @@ def build_cifar10_dataset(
             )
         else:
             ds = base
-        return ds, list(CIFAR10_CLASS_NAMES)
+        return ds, _extract_class_names(ds, num_classes=num_classes)
 
     data_root = str(Path(data_root).expanduser())
 
     if split == "train":
         if two_view:
-            base = datasets.CIFAR10(root=data_root, train=True, transform=None, download=download)
+            base = dataset_cls(root=data_root, train=True, transform=None, download=download)
             view1_tfm, view2_tfm, target_tfm = build_cifar10_multi_view_transforms(
+                dataset=dataset_name,
                 image_size=image_size,
                 aug_strength=aug_strength,
             )
@@ -217,23 +272,23 @@ def build_cifar10_dataset(
                 target_source=target_source,
             )
         else:
-            ds = datasets.CIFAR10(root=data_root, train=True, transform=tfm, download=download)
-        return ds, list(CIFAR10_CLASS_NAMES)
+            ds = dataset_cls(root=data_root, train=True, transform=tfm, download=download)
+        return ds, _extract_class_names(ds, num_classes=num_classes)
 
     if split == "test":
-        ds = datasets.CIFAR10(root=data_root, train=False, transform=tfm, download=download)
-        return ds, list(CIFAR10_CLASS_NAMES)
+        ds = dataset_cls(root=data_root, train=False, transform=tfm, download=download)
+        return ds, _extract_class_names(ds, num_classes=num_classes)
 
     # split == "val"
     if val_from_train:
-        full_train = datasets.CIFAR10(root=data_root, train=True, transform=tfm, download=download)
+        full_train = dataset_cls(root=data_root, train=True, transform=tfm, download=download)
         train_idx, val_idx = _make_split_indices(len(full_train), val_ratio=val_ratio, seed=seed)
         _ = train_idx  # documented: val comes from train holdout
         ds = Subset(full_train, val_idx)
     else:
-        ds = datasets.CIFAR10(root=data_root, train=False, transform=tfm, download=download)
+        ds = dataset_cls(root=data_root, train=False, transform=tfm, download=download)
 
-    return ds, list(CIFAR10_CLASS_NAMES)
+    return ds, _extract_class_names(ds, num_classes=num_classes)
 
 
 def build_cifar10_loader(
@@ -255,8 +310,10 @@ def build_cifar10_loader(
     two_view: bool = False,
     aug_strength: str = "medium",
     target_source: str = "view1",
+    dataset: str = "cifar10",
 ) -> Tuple[DataLoader, List[str]]:
     ds, class_names = build_cifar10_dataset(
+        dataset=dataset,
         data_root=data_root,
         split=split,
         image_size=image_size,
@@ -306,7 +363,8 @@ def make_batch_dict(batch) -> Dict[str, torch.Tensor]:
     return {"images": images, "labels": labels}
 
 
-def denormalize_cifar10(images: torch.Tensor) -> torch.Tensor:
-    mean = torch.tensor(CIFAR10_MEAN, device=images.device).view(1, 3, 1, 1)
-    std = torch.tensor(CIFAR10_STD, device=images.device).view(1, 3, 1, 1)
+def denormalize_cifar10(images: torch.Tensor, dataset: str = "cifar10") -> torch.Tensor:
+    mean_vals, std_vals = _dataset_stats(dataset)
+    mean = torch.tensor(mean_vals, device=images.device).view(1, 3, 1, 1)
+    std = torch.tensor(std_vals, device=images.device).view(1, 3, 1, 1)
     return images * std + mean

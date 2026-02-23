@@ -23,9 +23,20 @@ def _normalize_group(name: str) -> str:
     alias = {
         "text": "text_only",
         "recon": "recon_only",
-        "joint_conflict_aware": "joint_conflict",
-        "joint_conflictaware": "joint_conflict",
-        "conflict": "joint_conflict",
+        "joint_conflict_aware": "joint_pcgrad",
+        "joint_conflictaware": "joint_pcgrad",
+        "joint_conflict": "joint_pcgrad",
+        "conflict": "joint_pcgrad",
+        "joint_pc_grad": "joint_pcgrad",
+        "joint_pcgrad": "joint_pcgrad",
+        "pcgrad": "joint_pcgrad",
+        "joint_layercagrad": "joint_layer_cagrad",
+        "joint_layer_cagrad": "joint_layer_cagrad",
+        "layer_cagrad": "joint_layer_cagrad",
+        "joint_layerpcgrad": "joint_layer_pcgrad",
+        "joint_layer_pc_grad": "joint_layer_pcgrad",
+        "joint_layer_pcgrad": "joint_layer_pcgrad",
+        "layer_pcgrad": "joint_layer_pcgrad",
     }
     return alias.get(norm, norm)
 
@@ -53,8 +64,12 @@ def _infer_group(cfg: Dict, strategy: str, lambda_txt: float, lambda_rec: float)
     if lambda_txt == 0 and lambda_rec > 0:
         return "recon_only"
     s = strategy.lower()
+    if "layer_cagrad" in s:
+        return "joint_layer_cagrad"
+    if "layer_pcgrad" in s:
+        return "joint_layer_pcgrad"
     if s.startswith("conflict") or s == "pcgrad":
-        return "joint_conflict"
+        return "joint_pcgrad"
     if "cagrad" in s:
         return "joint_cagrad"
     if "mgda" in s:
@@ -92,10 +107,16 @@ def _load_run_row(run_dir: str) -> Dict:
     lambda_sup = float(get_by_dotted_key(cfg, "train.lambda_sup", get_by_dotted_key(cfg, "supcon.lambda", 0.0)))
     supcon_enabled = bool(get_by_dotted_key(cfg, "supcon.enabled", False) or lambda_sup > 0.0)
     supcon_tau = float(get_by_dotted_key(cfg, "supcon.tau", 0.1))
-    strategy_raw = str(get_by_dotted_key(cfg, "train.strategy", "naive"))
+    strategy_raw = str(
+        cos_summary.get("grad_strategy", get_by_dotted_key(cfg, "train.grad_strategy", get_by_dotted_key(cfg, "train.strategy", "naive")))
+    )
     s = strategy_raw.lower()
-    if s.startswith("conflict") or s == "pcgrad":
-        strategy = "conflict"
+    if "layer_cagrad" in s:
+        strategy = "layer_cagrad"
+    elif "layer_pcgrad" in s:
+        strategy = "layer_pcgrad"
+    elif s.startswith("conflict") or s == "pcgrad":
+        strategy = "pcgrad"
     elif "cagrad" in s:
         strategy = "cagrad"
     elif "mgda" in s:
@@ -113,6 +134,12 @@ def _load_run_row(run_dir: str) -> Dict:
     cos_vals = [float(x["cos"]) for x in cos_curve if isinstance(x, dict) and "cos" in x]
     cos_mean = cos_summary.get("cos_mean", _safe_mean(cos_vals, default=0.0))
     cos_neg_ratio = cos_summary.get("cos_neg_ratio", _safe_neg_ratio(cos_vals))
+    layer_cos_mean = float(cos_summary.get("layer_cos_mean", 0.0))
+    layer_cos_neg_ratio = float(cos_summary.get("layer_cos_neg_ratio", 0.0))
+    layer_alpha_mean = float(cos_summary.get("layer_alpha_mean", 0.5))
+    layer_asymproj_residual = float(
+        cos_summary.get("layer_asymproj_residual", get_by_dotted_key(cfg, "train.layer_asymproj_residual", 0.0))
+    )
 
     row = {
         "exp_name": Path(run_dir).name,
@@ -126,6 +153,7 @@ def _load_run_row(run_dir: str) -> Dict:
         "lambda_sup": lambda_sup,
         "supcon_enabled": supcon_enabled,
         "supcon_tau": supcon_tau,
+        "grad_strategy": strategy_raw,
         "strategy": strategy,
         "group": _infer_group(cfg, strategy_raw, lambda_txt, lambda_rec),
         "acc_txt": acc_txt,
@@ -134,6 +162,10 @@ def _load_run_row(run_dir: str) -> Dict:
         "recon_metric": recon_metric,
         "cos_mean": cos_mean,
         "cos_neg_ratio": cos_neg_ratio,
+        "layer_cos_mean": layer_cos_mean,
+        "layer_cos_neg_ratio": layer_cos_neg_ratio,
+        "layer_alpha_mean": layer_alpha_mean,
+        "layer_asymproj_residual": layer_asymproj_residual,
         "train_steps": int(cos_summary.get("train_steps", get_by_dotted_key(cfg, "train.steps", 0))),
         "walltime": cos_summary.get("walltime_sec", None),
         "run_dir": run_dir,
@@ -176,7 +208,10 @@ def _group_to_public_name(group: str) -> str:
         "text_only": "text-only",
         "recon_only": "recon-only",
         "joint_naive": "joint-naive",
-        "joint_conflict": "joint-conflict",
+        "joint_conflict": "joint-pcgrad",
+        "joint_pcgrad": "joint-pcgrad",
+        "joint_layer_cagrad": "joint-layer-cagrad",
+        "joint_layer_pcgrad": "joint-layer-pcgrad",
         "joint_cagrad": "joint-cagrad",
         "joint_mgda": "joint-mgda",
     }
@@ -215,6 +250,7 @@ def main() -> None:
         "lambda_sup",
         "supcon_enabled",
         "supcon_tau",
+        "grad_strategy",
         "strategy",
         "group",
         "acc_txt",
@@ -223,6 +259,10 @@ def main() -> None:
         "recon_metric",
         "cos_mean",
         "cos_neg_ratio",
+        "layer_cos_mean",
+        "layer_cos_neg_ratio",
+        "layer_alpha_mean",
+        "layer_asymproj_residual",
         "train_steps",
         "walltime",
         "recon_mode",
@@ -248,11 +288,16 @@ def main() -> None:
             "x_recon_metric": r["recon_metric"],
             "y_zero_shot_acc": r["zero_shot_acc"],
             "strategy": r["strategy"],
+            "grad_strategy": r["grad_strategy"],
             "lambda_cons": r["lambda_cons"],
             "consistency_enabled": r["consistency_enabled"],
             "lambda_sup": r["lambda_sup"],
             "supcon_enabled": r["supcon_enabled"],
             "supcon_tau": r["supcon_tau"],
+            "layer_cos_mean": r["layer_cos_mean"],
+            "layer_cos_neg_ratio": r["layer_cos_neg_ratio"],
+            "layer_alpha_mean": r["layer_alpha_mean"],
+            "layer_asymproj_residual": r["layer_asymproj_residual"],
         }
         for r in rows
         if r.get("recon_metric") is not None and r.get("zero_shot_acc") is not None
@@ -268,11 +313,16 @@ def main() -> None:
             "x_recon_metric",
             "y_zero_shot_acc",
             "strategy",
+            "grad_strategy",
             "lambda_cons",
             "consistency_enabled",
             "lambda_sup",
             "supcon_enabled",
             "supcon_tau",
+            "layer_cos_mean",
+            "layer_cos_neg_ratio",
+            "layer_alpha_mean",
+            "layer_asymproj_residual",
         ],
     )
     save_json(scatter_rows, str(out_dir / "pareto_scatter.json"))
@@ -307,6 +357,7 @@ def main() -> None:
             "dataset",
             "backbone",
             "strategy",
+            "grad_strategy",
             "seed",
             "lambda_txt",
             "lambda_rec",
@@ -319,6 +370,10 @@ def main() -> None:
             "recon_mse",
             "cos_mean",
             "cos_neg_ratio",
+            "layer_cos_mean",
+            "layer_cos_neg_ratio",
+            "layer_alpha_mean",
+            "layer_asymproj_residual",
             "train_steps",
             "walltime",
             "exp_name",
@@ -331,7 +386,9 @@ def main() -> None:
         "text-only": [],
         "recon-only": [],
         "joint-naive": [],
-        "joint-conflict": [],
+        "joint-pcgrad": [],
+        "joint-layer-cagrad": [],
+        "joint-layer-pcgrad": [],
         "joint-cagrad": [],
         "joint-mgda": [],
     }
@@ -349,6 +406,7 @@ def main() -> None:
                 "seed": r["seed"],
                 "backbone": r["backbone"],
                 "strategy": r["strategy"],
+                "grad_strategy": r["grad_strategy"],
                 "lambda_txt": r["lambda_txt"],
                 "lambda_rec": r["lambda_rec"],
                 "lambda_cons": r["lambda_cons"],
@@ -358,6 +416,10 @@ def main() -> None:
                 "supcon_tau": r["supcon_tau"],
                 "cos_mean": r["cos_mean"],
                 "cos_neg_ratio": r["cos_neg_ratio"],
+                "layer_cos_mean": r["layer_cos_mean"],
+                "layer_cos_neg_ratio": r["layer_cos_neg_ratio"],
+                "layer_alpha_mean": r["layer_alpha_mean"],
+                "layer_asymproj_residual": r["layer_asymproj_residual"],
             }
         )
 

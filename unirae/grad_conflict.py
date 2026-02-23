@@ -1,4 +1,15 @@
-from typing import Callable, List, Optional, Sequence, Tuple
+"""Gradient merge utilities.
+
+Baseline CIFAR-10 training currently uses:
+- apply_naive
+- apply_conflict_aware (PCGrad-style)
+- apply_cagrad
+- compute_grad_cosine
+
+Other layer-wise helpers below are kept for legacy run compatibility.
+"""
+
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 
@@ -29,6 +40,71 @@ def _weighted(grads: Sequence[torch.Tensor], weight: float) -> List[torch.Tensor
 
 def _add(g1: Sequence[torch.Tensor], g2: Sequence[torch.Tensor]) -> List[torch.Tensor]:
     return [a + b for a, b in zip(g1, g2)]
+
+
+def _group_l2_norm(grads: Sequence[torch.Tensor], eps: float = 1e-12) -> torch.Tensor:
+    if len(grads) == 0:
+        return torch.tensor(0.0)
+    acc = torch.zeros((), device=grads[0].device, dtype=grads[0].dtype)
+    for g in grads:
+        acc = acc + torch.sum(g * g)
+    return torch.sqrt(acc.clamp_min(eps))
+
+
+def _normalize_two_task_grads(
+    g1: Sequence[torch.Tensor],
+    g2: Sequence[torch.Tensor],
+    mode: str = "none",
+    indices: Optional[Sequence[int]] = None,
+    conflict_only: bool = False,
+    eps: float = 1e-12,
+) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    mode = str(mode).lower()
+    if mode in {"none", "off", "false", "0", ""}:
+        return list(g1), list(g2)
+
+    if indices is None:
+        sel = list(range(len(g1)))
+    else:
+        sel = sorted({int(i) for i in indices if 0 <= int(i) < len(g1)})
+
+    if len(sel) == 0:
+        return list(g1), list(g2)
+
+    g1_sel = [g1[i] for i in sel]
+    g2_sel = [g2[i] for i in sel]
+
+    if conflict_only:
+        dot = torch.zeros((), device=g1_sel[0].device, dtype=g1_sel[0].dtype)
+        for a, b in zip(g1_sel, g2_sel):
+            dot = dot + torch.sum(a * b)
+        if float(dot.item()) >= 0.0:
+            return list(g1), list(g2)
+
+    n1 = _group_l2_norm(g1_sel, eps=eps)
+    n2 = _group_l2_norm(g2_sel, eps=eps)
+
+    if mode in {"mean", "avg", "balance"}:
+        target = 0.5 * (n1 + n2)
+    elif mode in {"geom", "geometric", "geom_mean"}:
+        target = torch.sqrt((n1 * n2).clamp_min(eps))
+    elif mode in {"unit", "l2"}:
+        target = torch.ones((), device=n1.device, dtype=n1.dtype)
+    else:
+        raise ValueError(
+            f"Unsupported grad_norm_mode={mode}. "
+            "Use one of: none|mean|geom|unit."
+        )
+
+    s1 = (target / n1.clamp_min(eps)).detach()
+    s2 = (target / n2.clamp_min(eps)).detach()
+
+    out1 = list(g1)
+    out2 = list(g2)
+    for i in sel:
+        out1[i] = s1 * out1[i]
+        out2[i] = s2 * out2[i]
+    return out1, out2
 
 
 def grad_cosine(g1: Sequence[torch.Tensor], g2: Sequence[torch.Tensor]) -> float:
@@ -96,6 +172,9 @@ def _apply_multi_objective(
     lambda_txt: float,
     lambda_rec: float,
     merge_fn: Callable[[List[torch.Tensor], List[torch.Tensor], float], List[torch.Tensor]],
+    grad_norm_mode: str = "none",
+    grad_norm_indices: Optional[Sequence[int]] = None,
+    grad_norm_conflict_only: bool = False,
     extra_loss: Optional[torch.Tensor] = None,
 ) -> float:
     total = lambda_txt * loss_txt + lambda_rec * loss_rec
@@ -118,6 +197,13 @@ def _apply_multi_objective(
 
     wg_txt = _weighted(g_txt, lambda_txt)
     wg_rec = _weighted(g_rec, lambda_rec)
+    wg_txt, wg_rec = _normalize_two_task_grads(
+        wg_txt,
+        wg_rec,
+        mode=grad_norm_mode,
+        indices=grad_norm_indices,
+        conflict_only=grad_norm_conflict_only,
+    )
     merged_shared = merge_fn(wg_txt, wg_rec, cos)
     if extra_loss is not None:
         g_extra = torch.autograd.grad(extra_loss, shared_params, retain_graph=True, allow_unused=True)
@@ -140,6 +226,9 @@ def apply_conflict_aware(
     aux_params: Sequence[torch.nn.Parameter],
     lambda_txt: float,
     lambda_rec: float,
+    grad_norm_mode: str = "none",
+    grad_norm_indices: Optional[Sequence[int]] = None,
+    grad_norm_conflict_only: bool = False,
     extra_loss: Optional[torch.Tensor] = None,
 ) -> float:
     # PCGrad-style symmetric projection on conflicts.
@@ -156,6 +245,39 @@ def apply_conflict_aware(
         lambda_txt=lambda_txt,
         lambda_rec=lambda_rec,
         merge_fn=_merge,
+        grad_norm_mode=grad_norm_mode,
+        grad_norm_indices=grad_norm_indices,
+        grad_norm_conflict_only=grad_norm_conflict_only,
+        extra_loss=extra_loss,
+    )
+
+
+def apply_naive(
+    loss_txt: torch.Tensor,
+    loss_rec: torch.Tensor,
+    shared_params: Sequence[torch.nn.Parameter],
+    aux_params: Sequence[torch.nn.Parameter],
+    lambda_txt: float,
+    lambda_rec: float,
+    grad_norm_mode: str = "none",
+    grad_norm_indices: Optional[Sequence[int]] = None,
+    grad_norm_conflict_only: bool = False,
+    extra_loss: Optional[torch.Tensor] = None,
+) -> float:
+    def _merge(wg_txt: List[torch.Tensor], wg_rec: List[torch.Tensor], _: float) -> List[torch.Tensor]:
+        return _add(wg_txt, wg_rec)
+
+    return _apply_multi_objective(
+        loss_txt=loss_txt,
+        loss_rec=loss_rec,
+        shared_params=shared_params,
+        aux_params=aux_params,
+        lambda_txt=lambda_txt,
+        lambda_rec=lambda_rec,
+        merge_fn=_merge,
+        grad_norm_mode=grad_norm_mode,
+        grad_norm_indices=grad_norm_indices,
+        grad_norm_conflict_only=grad_norm_conflict_only,
         extra_loss=extra_loss,
     )
 
@@ -167,6 +289,9 @@ def apply_mgda_ub(
     aux_params: Sequence[torch.nn.Parameter],
     lambda_txt: float,
     lambda_rec: float,
+    grad_norm_mode: str = "none",
+    grad_norm_indices: Optional[Sequence[int]] = None,
+    grad_norm_conflict_only: bool = False,
     extra_loss: Optional[torch.Tensor] = None,
 ) -> float:
     def _merge(wg_txt: List[torch.Tensor], wg_rec: List[torch.Tensor], _: float) -> List[torch.Tensor]:
@@ -180,6 +305,9 @@ def apply_mgda_ub(
         lambda_txt=lambda_txt,
         lambda_rec=lambda_rec,
         merge_fn=_merge,
+        grad_norm_mode=grad_norm_mode,
+        grad_norm_indices=grad_norm_indices,
+        grad_norm_conflict_only=grad_norm_conflict_only,
         extra_loss=extra_loss,
     )
 
@@ -192,9 +320,27 @@ def apply_cagrad(
     lambda_txt: float,
     lambda_rec: float,
     beta: float = 0.5,
+    conflict_only: bool = False,
+    conflict_threshold: float = 0.0,
+    nonconflict_merge: str = "cagrad",
+    grad_norm_mode: str = "none",
+    grad_norm_indices: Optional[Sequence[int]] = None,
+    grad_norm_conflict_only: bool = False,
     extra_loss: Optional[torch.Tensor] = None,
 ) -> float:
-    def _merge(wg_txt: List[torch.Tensor], wg_rec: List[torch.Tensor], _: float) -> List[torch.Tensor]:
+    nonconflict_merge = str(nonconflict_merge).lower()
+    if nonconflict_merge not in {"cagrad", "sum", "avg", "average"}:
+        raise ValueError(
+            f"Unsupported nonconflict_merge={nonconflict_merge}. "
+            "Use one of: cagrad|sum|avg."
+        )
+
+    def _merge(wg_txt: List[torch.Tensor], wg_rec: List[torch.Tensor], cos: float) -> List[torch.Tensor]:
+        if conflict_only and cos >= float(conflict_threshold):
+            if nonconflict_merge in {"sum"}:
+                return _add(wg_txt, wg_rec)
+            if nonconflict_merge in {"avg", "average"}:
+                return [0.5 * (a + b) for a, b in zip(wg_txt, wg_rec)]
         return _cagrad_like_merge(wg_txt, wg_rec, beta=beta)
 
     return _apply_multi_objective(
@@ -205,6 +351,9 @@ def apply_cagrad(
         lambda_txt=lambda_txt,
         lambda_rec=lambda_rec,
         merge_fn=_merge,
+        grad_norm_mode=grad_norm_mode,
+        grad_norm_indices=grad_norm_indices,
+        grad_norm_conflict_only=grad_norm_conflict_only,
         extra_loss=extra_loss,
     )
 
@@ -221,3 +370,271 @@ def compute_grad_cosine(
     g1 = _materialize_grads(g1, params)
     g2 = _materialize_grads(g2, params)
     return grad_cosine(g1, g2)
+
+
+def apply_layerwise_pcgrad(
+    loss_u: torch.Tensor,
+    loss_g: torch.Tensor,
+    params: Sequence[torch.nn.Parameter],
+    group_to_indices: Dict[str, List[int]],
+    conflict_threshold: float = 0.0,
+    eps: float = 1e-12,
+) -> Dict[str, object]:
+    if len(params) == 0:
+        return {
+            "global_cos": 0.0,
+            "layer_cos_mean": 0.0,
+            "layer_cos_neg_ratio": 0.0,
+            "layer_cos": {},
+        }
+
+    raw_u = torch.autograd.grad(loss_u, params, retain_graph=True, allow_unused=True)
+    raw_g = torch.autograd.grad(loss_g, params, retain_graph=True, allow_unused=True)
+    g_u = _materialize_grads(raw_u, params)
+    g_g = _materialize_grads(raw_g, params)
+
+    merged = [_safe_zeros_like_param(p) for p in params]
+    layer_cos: Dict[str, float] = {}
+
+    for group_name, indices in group_to_indices.items():
+        if len(indices) == 0:
+            layer_cos[group_name] = 0.0
+            continue
+
+        dot = torch.zeros((), device=g_u[indices[0]].device, dtype=g_u[indices[0]].dtype)
+        nu = torch.zeros_like(dot)
+        ng = torch.zeros_like(dot)
+        for idx in indices:
+            gu = g_u[idx]
+            gg = g_g[idx]
+            dot = dot + torch.sum(gu * gg)
+            nu = nu + torch.sum(gu * gu)
+            ng = ng + torch.sum(gg * gg)
+
+        denom = torch.sqrt(nu.clamp_min(eps) * ng.clamp_min(eps))
+        cos = float((dot / denom).item()) if float(denom.item()) > 0 else 0.0
+        layer_cos[group_name] = cos
+
+        use_projection = (cos < conflict_threshold) and (float(dot.item()) < 0.0)
+        if use_projection:
+            ratio_u = (dot / ng.clamp_min(eps)).detach()
+            ratio_g = (dot / nu.clamp_min(eps)).detach()
+            for idx in indices:
+                gu_orig = g_u[idx]
+                gg_orig = g_g[idx]
+                gu_proj = gu_orig - ratio_u * gg_orig
+                gg_proj = gg_orig - ratio_g * gu_orig
+                merged[idx] = gu_proj + gg_proj
+        else:
+            for idx in indices:
+                merged[idx] = g_u[idx] + g_g[idx]
+
+    # Safety fallback for params not covered by any group.
+    covered = set()
+    for idxs in group_to_indices.values():
+        covered.update(idxs)
+    for idx in range(len(params)):
+        if idx not in covered:
+            merged[idx] = g_u[idx] + g_g[idx]
+
+    set_grads(params, merged)
+
+    layer_values = list(layer_cos.values())
+    if len(layer_values) == 0:
+        layer_cos_mean = 0.0
+        layer_cos_neg_ratio = 0.0
+    else:
+        layer_cos_mean = float(sum(layer_values) / len(layer_values))
+        layer_cos_neg_ratio = float(sum(1 for c in layer_values if c < conflict_threshold) / len(layer_values))
+
+    return {
+        "global_cos": grad_cosine(g_u, g_g),
+        "layer_cos_mean": layer_cos_mean,
+        "layer_cos_neg_ratio": layer_cos_neg_ratio,
+        "layer_cos": layer_cos,
+    }
+
+
+def apply_layerwise_cagrad(
+    loss_u: torch.Tensor,
+    loss_g: torch.Tensor,
+    params: Sequence[torch.nn.Parameter],
+    group_to_indices: Dict[str, List[int]],
+    beta: float = 0.5,
+    conflict_threshold: float = 0.0,
+    variant: str = "v2_gate",
+    gate_tau: float = 0.0,
+    gate_scale: float = 8.0,
+    prefer_understanding_on_conflict: bool = True,
+    alpha_min: float = 0.0,
+    alpha_max: float = 1.0,
+    gate_conflict_only: bool = True,
+    nonconflict_merge: str = "cagrad",
+    conflict_groups: Optional[Sequence[str]] = None,
+    layer_grad_normalize: bool = False,
+    layer_grad_normalize_target: str = "understanding",
+    layer_grad_normalize_strength: float = 1.0,
+    layer_grad_normalize_conflict_only: bool = False,
+    asym_proj_residual: float = 0.0,
+    eps: float = 1e-12,
+) -> Dict[str, object]:
+    if len(params) == 0:
+        return {
+            "global_cos": 0.0,
+            "layer_cos_mean": 0.0,
+            "layer_cos_neg_ratio": 0.0,
+            "layer_cos": {},
+            "layer_alpha_mean": 0.5,
+            "layer_alpha": {},
+        }
+
+    raw_u = torch.autograd.grad(loss_u, params, retain_graph=True, allow_unused=True)
+    raw_g = torch.autograd.grad(loss_g, params, retain_graph=True, allow_unused=True)
+    g_u = _materialize_grads(raw_u, params)
+    g_g = _materialize_grads(raw_g, params)
+
+    merged = [_safe_zeros_like_param(p) for p in params]
+    layer_cos: Dict[str, float] = {}
+    layer_alpha: Dict[str, float] = {}
+
+    variant = str(variant).lower()
+    alpha_min = float(max(0.0, min(1.0, alpha_min)))
+    alpha_max = float(max(alpha_min, min(1.0, alpha_max)))
+    gate_scale = float(gate_scale)
+    gate_tau = float(gate_tau)
+    nonconflict_merge = str(nonconflict_merge).lower()
+    layer_grad_normalize_target = str(layer_grad_normalize_target).lower()
+    layer_grad_normalize_strength = float(max(0.0, min(1.0, layer_grad_normalize_strength)))
+    asym_proj_residual = float(max(0.0, asym_proj_residual))
+    conflict_groups_set: Set[str] = set()
+    if conflict_groups is not None:
+        conflict_groups_set = {str(g).strip() for g in conflict_groups if str(g).strip()}
+
+    for group_name, indices in group_to_indices.items():
+        if len(indices) == 0:
+            layer_cos[group_name] = 0.0
+            layer_alpha[group_name] = 0.5
+            continue
+
+        gu_group = [g_u[idx] for idx in indices]
+        gg_group = [g_g[idx] for idx in indices]
+        cos = grad_cosine(gu_group, gg_group)
+        layer_cos[group_name] = cos
+
+        gu_merge = gu_group
+        gg_merge = gg_group
+        do_layer_norm = layer_grad_normalize
+        if do_layer_norm and layer_grad_normalize_conflict_only and not (cos < conflict_threshold):
+            do_layer_norm = False
+
+        if do_layer_norm:
+            norm_u = _group_l2_norm(gu_group, eps=eps)
+            norm_g = _group_l2_norm(gg_group, eps=eps)
+            if layer_grad_normalize_target in {"understanding", "u", "txt"}:
+                scale = (norm_u / norm_g.clamp_min(eps)).detach()
+                gg_scaled = [scale * gg for gg in gg_group]
+                s = layer_grad_normalize_strength
+                gg_merge = [(1.0 - s) * gg + s * ggs for gg, ggs in zip(gg_group, gg_scaled)]
+            elif layer_grad_normalize_target in {"generation", "g", "rec"}:
+                scale = (norm_g / norm_u.clamp_min(eps)).detach()
+                gu_scaled = [scale * gu for gu in gu_group]
+                s = layer_grad_normalize_strength
+                gu_merge = [(1.0 - s) * gu + s * gus for gu, gus in zip(gu_group, gu_scaled)]
+            else:
+                raise ValueError(
+                    "Unsupported layer_grad_normalize_target="
+                    f"{layer_grad_normalize_target}. Use understanding|generation."
+                )
+
+        if variant in {"asym_proj", "asymmetric_proj", "layer_asym_proj"}:
+            # Asymmetric Layer-PCGrad:
+            # - if non-conflict, keep full signal from both tasks: g = gu + gg
+            # - if conflict, remove from gg the component that hurts understanding.
+            if len(conflict_groups_set) > 0 and group_name not in conflict_groups_set:
+                layer_alpha[group_name] = 0.5
+                merged_group = _add(gu_merge, gg_merge)
+                for idx, gm in zip(indices, merged_group):
+                    merged[idx] = gm
+                continue
+
+            dot = torch.zeros((), device=gu_merge[0].device, dtype=gu_merge[0].dtype)
+            nu = torch.zeros_like(dot)
+            for gu, gg in zip(gu_merge, gg_merge):
+                dot = dot + torch.sum(gg * gu)
+                nu = nu + torch.sum(gu * gu)
+
+            is_conflict = cos < conflict_threshold
+            if is_conflict and float(dot.item()) < 0.0:
+                ratio = (dot / nu.clamp_min(eps)).detach()
+                gg_proj_group = [gg - ratio * gu for gu, gg in zip(gu_merge, gg_merge)]
+                # Re-inject a controllable fraction of the removed generation component:
+                # residual=0.0 -> pure projection; residual=1.0 -> original gg;
+                # residual>1.0 -> over-inject generation component.
+                if asym_proj_residual > 0.0:
+                    gg_merge_group = [
+                        gg_proj + asym_proj_residual * (gg - gg_proj)
+                        for gg, gg_proj in zip(gg_merge, gg_proj_group)
+                    ]
+                else:
+                    gg_merge_group = gg_proj_group
+                merged_group = [gu + gg_mix for gu, gg_mix in zip(gu_merge, gg_merge_group)]
+                layer_alpha[group_name] = 1.0
+            else:
+                layer_alpha[group_name] = 0.5
+                merged_group = _add(gu_merge, gg_merge)
+        elif variant in {"v2", "v2_gate", "gate"}:
+            if gate_conflict_only and cos >= conflict_threshold:
+                layer_alpha[group_name] = 0.5
+                if nonconflict_merge == "sum":
+                    merged_group = _add(gu_merge, gg_merge)
+                else:
+                    merged_group = _cagrad_like_merge(gu_merge, gg_merge, beta=beta)
+                for idx, gm in zip(indices, merged_group):
+                    merged[idx] = gm
+                continue
+            if prefer_understanding_on_conflict:
+                # More conflict (cos smaller than tau) -> alpha moves toward understanding.
+                logit = gate_scale * (gate_tau - cos)
+            else:
+                logit = gate_scale * (cos - gate_tau)
+            alpha_t = torch.sigmoid(torch.tensor(logit, device=gu_group[0].device, dtype=gu_group[0].dtype))
+            alpha = float(alpha_t.clamp(alpha_min, alpha_max).item())
+            layer_alpha[group_name] = alpha
+            merged_group = [alpha * gu + (1.0 - alpha) * gg for gu, gg in zip(gu_merge, gg_merge)]
+        else:
+            layer_alpha[group_name] = 0.5
+            if cos < conflict_threshold:
+                merged_group = _cagrad_like_merge(gu_merge, gg_merge, beta=beta)
+            else:
+                merged_group = _add(gu_merge, gg_merge)
+
+        for idx, gm in zip(indices, merged_group):
+            merged[idx] = gm
+
+    covered = set()
+    for idxs in group_to_indices.values():
+        covered.update(idxs)
+    for idx in range(len(params)):
+        if idx not in covered:
+            merged[idx] = g_u[idx] + g_g[idx]
+
+    set_grads(params, merged)
+
+    layer_values = list(layer_cos.values())
+    if len(layer_values) == 0:
+        layer_cos_mean = 0.0
+        layer_cos_neg_ratio = 0.0
+    else:
+        layer_cos_mean = float(sum(layer_values) / len(layer_values))
+        layer_cos_neg_ratio = float(sum(1 for c in layer_values if c < conflict_threshold) / len(layer_values))
+    alpha_values = list(layer_alpha.values())
+    layer_alpha_mean = float(sum(alpha_values) / len(alpha_values)) if len(alpha_values) > 0 else 0.5
+
+    return {
+        "global_cos": grad_cosine(g_u, g_g),
+        "layer_cos_mean": layer_cos_mean,
+        "layer_cos_neg_ratio": layer_cos_neg_ratio,
+        "layer_cos": layer_cos,
+        "layer_alpha_mean": layer_alpha_mean,
+        "layer_alpha": layer_alpha,
+    }

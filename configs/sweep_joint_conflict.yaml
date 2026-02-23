@@ -2,7 +2,7 @@ seed: 42
 
 experiment:
   name: sweep_joint_conflict
-  group: joint_conflict
+  group: joint_pcgrad
 
 output:
   root: runs
@@ -62,10 +62,10 @@ train:
   batch_size: 32
   lambda_txt: 1.0
   lambda_rec: 1.0
-  strategy: conflict_aware
+  strategy: pcgrad
 
 sweep:
-  mode: joint_conflict
+  mode: joint_pcgrad
   lambda_values: [0.25, 0.5, 1.0, 2.0]
   seeds: [42, 43]
 

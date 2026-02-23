@@ -1,8 +1,8 @@
 seed: 42
 
 experiment:
-  name: cifar10_joint_conflict
-  group: joint_pcgrad
+  name: cifar10_baseline_joint_cagrad
+  group: joint_cagrad
 
 output:
   root: runs
@@ -36,12 +36,11 @@ text:
 
 train:
   mode: joint
-  steps: 1000
+  steps: 5000
   lambda_txt: 1.0
   lambda_rec: 1.0
-  lambda_cons: 0.0
-  lambda_sup: 0.0
-  strategy: pcgrad
+  grad_strategy: cagrad
+  cagrad_beta: 0.5
   shared_params: backbone
 
 optim:
@@ -51,8 +50,8 @@ optim:
 log:
   every: 20
   cos_every: 20
-  save_every: 200
-  eval_every: 200
+  save_every: 1000
+  eval_every: 1000
 
 eval:
   split: test
@@ -60,30 +59,6 @@ eval:
   max_batches: 50
   save_recon_samples: true
   sample_images: 8
-
-consistency:
-  enabled: false
-  two_view: false
-  aug_strength: medium
-  target: txt_head
-  loss_type: cosine
-  lambda_cons: 0.1
-  merge_into_understanding: true
-  recon_target_source: view1
-
-supcon:
-  enabled: false
-  two_view: true
-  aug: medium
-  lambda: 0.5
-  tau: 0.1
-  embed: txt
-  merge_into_understanding: true
-
-sweep:
-  mode: joint_pcgrad
-  lambda_values: [0.25, 0.5, 1.0, 2.0]
-  seeds: [42, 43]
 
 accelerate:
   mixed_precision: "no"

@@ -13,7 +13,7 @@
 set -euo pipefail
 
 CONFIG_PATH=${1:-configs/sweep_joint_conflict.yaml}
-SWEEP_MODE=${2:-auto}            # text | recon | joint_naive | joint_conflict | auto
+SWEEP_MODE=${2:-auto}            # text | recon | joint_naive | joint_pcgrad | auto
 CONDA_ENV=${CONDA_ENV:-diffuser310}
 TRAIN_MODULE=${TRAIN_MODULE:-unirae.train}
 RUN_PREFIX=${RUN_PREFIX:-}
@@ -30,7 +30,7 @@ import yaml
 cfg = yaml.safe_load(open(sys.argv[1], 'r', encoding='utf-8')) or {}
 mode_in = sys.argv[2]
 sweep_cfg = cfg.get('sweep', {})
-mode = mode_in if mode_in != 'auto' else str(sweep_cfg.get('mode', 'joint_conflict'))
+mode = mode_in if mode_in != 'auto' else str(sweep_cfg.get('mode', 'joint_pcgrad'))
 
 lambdas = sweep_cfg.get('lambda_values', [0.25, 0.5, 1.0, 2.0])
 seeds = sweep_cfg.get('seeds', [42, 43])
@@ -70,8 +70,8 @@ case "$MODE" in
     LTXT="0"; LREC="$LAMBDA"; STRATEGY="naive"; GROUP="recon_only" ;;
   joint_naive)
     LTXT="$LAMBDA"; LREC="$LAMBDA"; STRATEGY="naive"; GROUP="joint_naive" ;;
-  joint_conflict)
-    LTXT="$LAMBDA"; LREC="$LAMBDA"; STRATEGY="conflict_aware"; GROUP="joint_conflict" ;;
+  joint_conflict|joint_pcgrad)
+    LTXT="$LAMBDA"; LREC="$LAMBDA"; STRATEGY="pcgrad"; GROUP="joint_pcgrad" ;;
   *)
     echo "Unknown mode=$MODE"
     exit 1

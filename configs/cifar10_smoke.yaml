@@ -2,7 +2,7 @@ seed: 42
 
 experiment:
   name: cifar10_smoke
-  group: joint_conflict
+  group: joint_pcgrad
 
 output:
   root: runs
@@ -35,13 +35,11 @@ text:
   temperature: 0.07
 
 train:
-  mode: joint                  # baseline | text_only | recon_only | joint
-  steps: 1000
+  mode: joint                  # joint | text_only | recon_only
+  steps: 200
   lambda_txt: 1.0
   lambda_rec: 1.0
-  lambda_cons: 0.0
-  lambda_sup: 0.0
-  strategy: conflict_aware     # naive | conflict_aware
+  strategy: pcgrad             # naive | pcgrad | cagrad
   shared_params: backbone      # backbone | all
 
 optim:
@@ -60,30 +58,6 @@ eval:
   max_batches: 50
   save_recon_samples: true
   sample_images: 8
-
-consistency:
-  enabled: false
-  two_view: false
-  aug_strength: medium         # light | medium | strong
-  target: txt_head             # txt_head | clip | dino
-  loss_type: cosine            # cosine | mse
-  lambda_cons: 0.1
-  merge_into_understanding: true
-  recon_target_source: view1 # original | view1 | view2
-
-supcon:
-  enabled: false
-  two_view: true
-  aug: medium                  # weak | medium | strong
-  lambda: 0.5
-  tau: 0.1
-  embed: txt                   # txt | clip | shared
-  merge_into_understanding: true
-
-sweep:
-  mode: joint_conflict
-  lambda_values: [0.25, 0.5, 1.0, 2.0]
-  seeds: [42, 43]
 
 accelerate:
   mixed_precision: "no"

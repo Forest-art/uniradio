@@ -1,8 +1,8 @@
 seed: 42
 
 experiment:
-  name: cifar10_joint_conflict
-  group: joint_pcgrad
+  name: cifar10_resnet18_layerpcgrad
+  group: joint_layer_pcgrad
 
 output:
   root: runs
@@ -36,30 +36,14 @@ text:
 
 train:
   mode: joint
-  steps: 1000
+  steps: 5000
   lambda_txt: 1.0
   lambda_rec: 1.0
   lambda_cons: 0.0
   lambda_sup: 0.0
-  strategy: pcgrad
+  grad_strategy: layer_pcgrad
+  conflict_threshold: 0.0
   shared_params: backbone
-
-optim:
-  lr: 3.0e-4
-  weight_decay: 1.0e-4
-
-log:
-  every: 20
-  cos_every: 20
-  save_every: 200
-  eval_every: 200
-
-eval:
-  split: test
-  batch_size: 256
-  max_batches: 50
-  save_recon_samples: true
-  sample_images: 8
 
 consistency:
   enabled: false
@@ -80,10 +64,22 @@ supcon:
   embed: txt
   merge_into_understanding: true
 
-sweep:
-  mode: joint_pcgrad
-  lambda_values: [0.25, 0.5, 1.0, 2.0]
-  seeds: [42, 43]
+optim:
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+
+log:
+  every: 20
+  cos_every: 20
+  save_every: 1000
+  eval_every: 1000
+
+eval:
+  split: test
+  batch_size: 256
+  max_batches: 50
+  save_recon_samples: true
+  sample_images: 8
 
 accelerate:
   mixed_precision: "no"

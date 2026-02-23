@@ -10,5 +10,7 @@ tmp_hf_imagenet_disk/
 *.log
 slurm-*.out
 slurm-*.err
+slurm/logs/*.out
+slurm/logs/*.err
 
 .DS_Store

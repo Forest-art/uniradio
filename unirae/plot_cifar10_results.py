@@ -13,18 +13,16 @@ GROUP_ORDER = [
     "text-only",
     "recon-only",
     "joint-naive",
-    "joint-conflict",
+    "joint-pcgrad",
     "joint-cagrad",
-    "joint-mgda",
 ]
 GROUP_COLOR = {
     "baseline": "#6e6e6e",
     "text-only": "#1f77b4",
     "recon-only": "#ff7f0e",
     "joint-naive": "#2ca02c",
-    "joint-conflict": "#d62728",
+    "joint-pcgrad": "#d62728",
     "joint-cagrad": "#9467bd",
-    "joint-mgda": "#8c564b",
 }
 
 
@@ -49,10 +47,8 @@ def infer_group(exp_name: str, strategy: str, lambda_txt: float, lambda_rec: flo
         return "recon-only"
     if "cagrad" in n or s == "cagrad":
         return "joint-cagrad"
-    if "mgda" in n or s in {"mgda", "mgda_ub"}:
-        return "joint-mgda"
     if "pcgrad" in n or "conflict" in n or s in {"conflict", "pcgrad"}:
-        return "joint-conflict"
+        return "joint-pcgrad"
     if "naive" in n or s == "naive":
         return "joint-naive"
     if lt > 0 and lr > 0:
@@ -127,7 +123,7 @@ def plot_tradeoff(rows: List[Dict], out_path: str) -> None:
         ax.scatter([mean(xs)], [mean(ys)], marker="X", s=180, c=color, edgecolor="black", linewidth=0.7)
 
     jn = [r for r in rows if r["group"] == "joint-naive" and r["acc_txt"] is not None and r["recon_mse"] is not None]
-    jc = [r for r in rows if r["group"] == "joint-conflict" and r["acc_txt"] is not None and r["recon_mse"] is not None]
+    jc = [r for r in rows if r["group"] == "joint-pcgrad" and r["acc_txt"] is not None and r["recon_mse"] is not None]
     if jn and jc:
         x1, y1 = mean([r["recon_mse"] for r in jn]), mean([r["acc_txt"] for r in jn])
         x2, y2 = mean([r["recon_mse"] for r in jc]), mean([r["acc_txt"] for r in jc])
@@ -189,7 +185,7 @@ def plot_cos_curve(cos_json_path: str, out_path: str, exp_prefix: str) -> None:
         if exp_prefix and not exp_name.startswith(exp_prefix):
             continue
         group = payload.get("group", "")
-        if group not in {"joint-naive", "joint-conflict"}:
+        if group not in {"joint-naive", "joint-pcgrad", "joint-cagrad"}:
             continue
         curve = payload.get("curve", [])
         if not curve:
