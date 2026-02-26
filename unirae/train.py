@@ -1,5 +1,6 @@
 import argparse
 import os
+import json
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -137,6 +138,23 @@ def run_eval(
     save_json(u, os.path.join(run_dir, "understanding.json"))
     save_json(g, os.path.join(run_dir, "generation.json"))
     save_json({"step": step, "understanding": u, "generation": g}, os.path.join(run_dir, "eval_last.json"))
+
+    # Print a compact eval summary to stdout so it appears in slurm logs.
+    u_compact = {
+        "acc_txt": u.get("acc_txt"),
+        "zero_shot_acc": u.get("zero_shot_acc"),
+        "zero_shot_loss": u.get("zero_shot_loss"),
+        "num_samples": u.get("num_samples"),
+    }
+    g_compact = {
+        "mse": g.get("mse", g.get("recon_mse")),
+        "recon_mse": g.get("recon_mse", g.get("mse")),
+        "psnr": g.get("psnr"),
+        "lpips": g.get("lpips"),
+        "num_batches": g.get("num_batches"),
+    }
+    print(f"[eval][step={step}] understanding={json.dumps(u_compact, ensure_ascii=False)}")
+    print(f"[eval][step={step}] generation={json.dumps(g_compact, ensure_ascii=False)}")
 
 
 def _dist_mean_scalar(accelerator: Accelerator, value, device: torch.device) -> float:
