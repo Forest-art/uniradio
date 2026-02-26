@@ -1,0 +1,68 @@
+seed: 42
+
+experiment:
+  name: imagenet_dino_rae_decoder_only
+  group: stage1_decoder_only
+
+output:
+  root: runs
+
+accelerate:
+  mixed_precision: bf16
+
+data:
+  data_root: /path/to/imagenet
+  data_format: auto        # auto | imagefolder | hf_disk
+  hf_load_from_disk: null  # e.g. /path/to/imagenet_hf_saved
+  hf_split_train: train
+  hf_split_val: validation
+  hf_image_key: image
+  hf_label_key: label
+  class_names_file: null
+  image_size: 224
+  num_workers: 8
+
+model:
+  num_classes: 1000
+  dino_variant: vit_base               # vit_small | vit_base
+  pretrained: true
+  lora_rank: 8
+  lora_alpha: 16.0
+  lora_last_n_blocks: 0                # Stage-1 strict: no LoRA injection
+  decoder_dim: 512
+  decoder_depth: 8
+  decoder_heads: 16
+  decoder_mlp_ratio: 4.0
+  decoder_drop_rate: 0.0
+  decoder_noise_tau: 0.8              # RAE: 训练常用 tau=0.8
+  use_grad_checkpointing: false
+
+recon:
+  pixel_loss: l1                       # l1 | mse | huber
+  huber_delta: 1.0
+
+train:
+  steps: 20000
+  batch_size: 64
+  clip_grad: 0.0
+  ema_decay: 0.9978
+
+optim:
+  lr: 2.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+
+scheduler:
+  type: cosine
+  warmup_steps: 1000
+  final_lr: 2.0e-5
+
+log:
+  every: 20
+  eval_every: 1000
+  save_every: 1000
+
+eval:
+  batch_size: 64
+  max_batches: 50
+  use_ema: true

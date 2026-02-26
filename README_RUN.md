@@ -142,3 +142,72 @@ STEPS=20000 \
 SEEDS=42 \
 bash slurm/submit_imagenet_baselines.sh
 ```
+
+## 11) RAE 对齐参数（谢赛宁 RAE 风格）
+- 当前 `unirae/decoder.py` 已支持 `decoder.noise_tau`，默认值 `0.8`：
+  - 仅在 `train()` 时向 decoder 输入注入 RAE 风格噪声（`sigma~U(0,tau)` 后乘高斯）
+  - `eval()` 时自动关闭噪声
+- 推荐与当前 ImageNet baseline 一起显式设置：
+  - `decoder.hidden_dim=1024`
+  - `decoder.feature_target_dim=1024`
+  - `decoder.token_dropout=0.0`
+  - `decoder.noise_tau=0.8`
+
+8 卡直跑（非 sbatch，HF `load_from_disk`，每 1000 step eval 并在日志打印结果）：
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+python -m accelerate.commands.launch --num_processes 8 --num_machines 1 -m unirae.train \
+  --config configs/smoke.yaml \
+  --run_name imagenet8x_conflict_rae_tau08_s42 \
+  --set seed=42 \
+  --set data.data_format=hf_disk \
+  --set data.hf_load_from_disk=/path/to/imagenet_hf_saved \
+  --set data.hf_split_train=train \
+  --set data.hf_split_val=validation \
+  --set train.steps=20000 \
+  --set train.strategy=conflict_aware \
+  --set train.lambda_txt=1.0 \
+  --set train.lambda_rec=1.0 \
+  --set train.batch_size=128 \
+  --set eval.batch_size=128 \
+  --set log.eval_every=1000 \
+  --set decoder.hidden_dim=1024 \
+  --set decoder.feature_target_dim=1024 \
+  --set decoder.token_dropout=0.0 \
+  --set decoder.noise_tau=0.8
+```
+
+## 12) DINO RAE Stage-1（只训练重建 Decoder）
+- 新入口：`unirae/train_dino_decoder_only.py`
+- 逻辑对齐 RAE Stage-1 的核心训练范式：
+  - 冻结 DINO encoder
+  - 不注入 LoRA（`lora_last_n_blocks=0`）
+  - 理解头冻结（参数不更新）
+  - 只优化 Transformer decoder
+  - 训练噪声 `tau=0.8`（`sigma~U(0,tau)` 的 RAE 风格噪声）
+  - 数据预处理对齐：`Resize -> (Random/Center)Crop -> ToTensor`，encoder 侧做 DINO mean/std 归一化
+  - 默认 `L1` 重建损失、`EMA(decay=0.9978)`、`cosine + warmup` 学习率
+
+配置文件：
+- `configs/imagenet_dino_rae_decoder_only.yaml`
+
+8 卡直跑（HF `load_from_disk`）：
+```bash
+cd /project/peilab/luxiaocheng/projects/unirae_radio
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+python -m accelerate.commands.launch --num_processes 8 --num_machines 1 -m unirae.train_dino_decoder_only \
+  --config configs/imagenet_dino_rae_decoder_only.yaml \
+  --run_name imagenet_dino_rae_dec_only_s42 \
+  --set data.data_format=hf_disk \
+  --set data.hf_load_from_disk=/path/to/imagenet_hf_saved \
+  --set data.hf_split_train=train \
+  --set data.hf_split_val=validation \
+  --set train.steps=20000 \
+  --set log.eval_every=1000 \
+  --set eval.max_batches=50
+```
+
+日志中会直接打印：
+- 训练：`loss/mse/psnr`
+- 评估：`[eval][step=...] {recon_loss, mse, psnr, num_samples}`
