@@ -103,6 +103,70 @@ class HFDiskVisionDataset(Dataset):
         return image, label
 
 
+class HFImageNetDataset(Dataset):
+    """HuggingFace ImageNet dataset wrapper with resilient sample loading.
+
+    行为与用户给出的逻辑一致：
+    - 读取 item['image'] 与 item['label']
+    - 灰度图转 RGB
+    - 如果样本损坏/处理失败，打印错误并跳到下一个样本
+    """
+
+    def __init__(
+        self,
+        hf_dataset,
+        transform=None,
+        image_key: str = "image",
+        label_key: str = "label",
+        max_retry: Optional[int] = None,
+    ):
+        self.dataset = hf_dataset
+        self.transform = transform
+        self.image_key = image_key
+        self.label_key = label_key
+        self.max_retry = max_retry
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def _process_item(self, item):
+        image = item[self.image_key]
+        label = int(item[self.label_key])
+
+        # ImageNet 存在少量灰度图，统一转成 RGB 便于后续 transforms。
+        if hasattr(image, "mode") and image.mode != "RGB":
+            image = image.convert("RGB")
+
+        if self.transform is not None:
+            image = self.transform(image)
+
+        return image, label
+
+    def __getitem__(self, idx):
+        n = len(self.dataset)
+        if n <= 0:
+            raise IndexError("HFImageNetDataset is empty.")
+
+        start = int(idx) % n
+        max_retry = n if self.max_retry is None else max(1, int(self.max_retry))
+        max_retry = min(max_retry, n)
+
+        last_error: Optional[Exception] = None
+        for offset in range(max_retry):
+            cur = (start + offset) % n
+            try:
+                item = self.dataset[cur]
+                return self._process_item(item)
+            except Exception as e:  # noqa: BLE001
+                print(f"Error processing sample at index {cur}: {e}")
+                last_error = e
+
+        raise RuntimeError(
+            f"Failed to load a valid HF ImageNet sample after {max_retry} retries "
+            f"(start index: {start})."
+        ) from last_error
+
+
 def build_imagenet_transforms(image_size: int, split: str) -> transforms.Compose:
     if split == "train":
         return transforms.Compose(
@@ -156,7 +220,7 @@ def build_imagenet_dataset(
         ds_all = load_from_disk(path)
         ds_split = _resolve_hf_split(ds_all, hf_split)
 
-        ds = HFDiskVisionDataset(ds_split, transform=tfm, image_key=hf_image_key, label_key=hf_label_key)
+        ds = HFImageNetDataset(ds_split, transform=tfm, image_key=hf_image_key, label_key=hf_label_key)
         class_names = _infer_hf_class_names(ds_split, label_key=hf_label_key, class_names_file=class_names_file)
         return ds, class_names
 

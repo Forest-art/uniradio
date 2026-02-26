@@ -68,3 +68,77 @@ Each run writes to `runs/<run_name>/`:
 ## 7) Notes
 - Existing old configs/scripts are treated as legacy artifacts and are not part of the current baseline workflow.
 - If you need to compare the five baselines, run with the same `seed`, `steps`, and data split settings.
+
+## 8) ImageNet HF Loader (for `unirae.train.py`)
+- ImageNet 数据入口在 `unirae/data_imagenet.py`。
+- `data_format=auto` 时会自动选择：
+  - `hf_disk`: 当设置 `hf_load_from_disk` 或 `data_root` 看起来像 HF `save_to_disk` 目录
+  - `imagefolder`: 否则走 `torchvision.datasets.ImageFolder`
+- 新增 `HFImageNetDataset` 的容错读取逻辑：
+  - 读取 `item['image']` 与 `item['label']`
+  - 非 RGB 图自动 `convert('RGB')`
+  - 某个样本解码/处理失败时，会打印错误并自动尝试下一个样本（循环重试，最多一个 epoch 长度）
+- 常用 HF 配置项（`unirae/train.py` 会透传）：
+  - `data.hf_load_from_disk`
+  - `data.hf_split_train` / `data.hf_split_val`
+  - `data.hf_image_key` / `data.hf_label_key`
+
+## 9) ImageNet 启动命令（`unirae.train`）
+单卡本地快速启动（ImageFolder）：
+```bash
+python -m accelerate.commands.launch --num_processes 1 -m unirae.train \
+  --config configs/smoke.yaml \
+  --run_name imagenet_joint_naive_s42 \
+  --set seed=42 \
+  --set data.data_root=/path/to/imagenet \
+  --set data.data_format=imagefolder \
+  --set train.steps=20000 \
+  --set train.strategy=naive \
+  --set train.lambda_txt=1.0 \
+  --set train.lambda_rec=1.0
+```
+
+单卡本地快速启动（HF `load_from_disk`）：
+```bash
+python -m accelerate.commands.launch --num_processes 1 -m unirae.train \
+  --config configs/smoke.yaml \
+  --run_name imagenet_joint_conflict_s42 \
+  --set seed=42 \
+  --set data.data_format=hf_disk \
+  --set data.hf_load_from_disk=/path/to/imagenet_hf_saved \
+  --set data.hf_split_train=train \
+  --set data.hf_split_val=validation \
+  --set train.steps=20000 \
+  --set train.strategy=conflict_aware \
+  --set train.lambda_txt=1.0 \
+  --set train.lambda_rec=1.0
+```
+
+## 10) ImageNet Baseline 一键脚本（Slurm）
+脚本：`slurm/submit_imagenet_baselines.sh`
+
+默认会按每个 seed 提交 4 个 baseline：
+- `joint_naive`
+- `joint_conflict`
+- `text_only_naive`
+- `recon_only_naive`
+
+ImageFolder 示例：
+```bash
+DATA_ROOT=/path/to/imagenet \
+DATA_FORMAT=imagefolder \
+STEPS=20000 \
+SEEDS=42,43 \
+bash slurm/submit_imagenet_baselines.sh
+```
+
+HF `load_from_disk` 示例：
+```bash
+DATA_FORMAT=hf_disk \
+HF_LOAD_FROM_DISK=/path/to/imagenet_hf_saved \
+HF_SPLIT_TRAIN=train \
+HF_SPLIT_VAL=validation \
+STEPS=20000 \
+SEEDS=42 \
+bash slurm/submit_imagenet_baselines.sh
+```
