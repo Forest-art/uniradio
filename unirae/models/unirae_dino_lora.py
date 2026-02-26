@@ -180,6 +180,8 @@ class UniRAEDinoLoRA(nn.Module):
         "vit_base": "vit_base_patch14_dinov2",
         "vit_small_patch14_dinov2": "vit_small_patch14_dinov2",
         "vit_base_patch14_dinov2": "vit_base_patch14_dinov2",
+        "vit_small_patch14_reg4_dinov2": "vit_small_patch14_reg4_dinov2",
+        "vit_base_patch14_reg4_dinov2": "vit_base_patch14_reg4_dinov2",
     }
 
     def __init__(
@@ -202,12 +204,7 @@ class UniRAEDinoLoRA(nn.Module):
         super().__init__()
         import timm
 
-        model_name = self._DINO_NAME_MAP.get(dino_variant.lower())
-        if model_name is None:
-            raise ValueError(
-                f"Unsupported dino_variant={dino_variant}. "
-                "Use vit_small|vit_base|vit_small_patch14_dinov2|vit_base_patch14_dinov2."
-            )
+        model_name = self._DINO_NAME_MAP.get(dino_variant.lower(), dino_variant)
 
         # global_pool='' 可拿到完整 token 序列 [CLS + patches]。
         self.encoder = timm.create_model(
@@ -332,8 +329,8 @@ class UniRAEDinoLoRA(nn.Module):
 
     def forward(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
         tokens = self.encode_tokens(images)
-        cls_token = tokens[:, 0]       # [B, C]
-        patch_tokens = tokens[:, 1:]   # [B, N, C]
+        cls_token = tokens[:, 0]                  # [B, C]
+        patch_tokens = tokens[:, -self.num_patches:]  # 兼容 register token 场景
 
         logits = self.understanding_head(cls_token)
         pred_patches = self.decoder(patch_tokens)

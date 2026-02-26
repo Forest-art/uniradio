@@ -211,3 +211,39 @@ python -m accelerate.commands.launch --num_processes 8 --num_machines 1 -m unira
 日志中会直接打印：
 - 训练：`loss/mse/psnr`
 - 评估：`[eval][step=...] {recon_loss, mse, psnr, num_samples}`
+
+## 13) DINO RAE Stage-1 Full（uniradio 内集成训练+评测）
+- 入口：`unirae/train_dino_rae_stage1.py`
+- 目标：在 `unirae_radio` 内复用 RAE 全量 Stage-1 逻辑（不是单独跑 RAE 仓库）
+  - 训练：`L1 + LPIPS + GAN + adaptive d_weight + DiffAug + EMA + cosine`
+  - 评测：可选调用官方 `RAE eval` 计算 `PSNR/SSIM/rFID`
+
+配置文件：
+- `configs/imagenet_dino_rae_stage1_full.yaml`
+
+使用前准备：
+1. 准备 RAE 依赖代码（默认路径）：`/project/peilab/luxiaocheng/projects/RAE`
+2. 准备判别器权重：`gan.disc.arch.dino_ckpt_path`
+3. 若启用 `rFID`，准备 `eval.reference_npz_path`
+
+8 卡直跑（HF `load_from_disk`）：
+```bash
+cd /project/peilab/luxiaocheng/projects/unirae_radio
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+python -m accelerate.commands.launch --num_processes 8 --num_machines 1 -m unirae.train_dino_rae_stage1 \
+  --config configs/imagenet_dino_rae_stage1_full.yaml \
+  --run_name uniradio_rae_stage1_full_s42 \
+  --set data.data_format=hf_disk \
+  --set data.hf_load_from_disk=/path/to/imagenet_hf_saved \
+  --set data.hf_split_train=train \
+  --set data.hf_split_val=validation \
+  --set gan.disc.arch.dino_ckpt_path=/path/to/RAE/models/discs/dino_vit_small_patch8_224.pth \
+  --set eval.reference_npz_path=/path/to/imagenet_val_224_or_256.npz \
+  --set train.steps=20000 \
+  --set log.eval_every=1000
+```
+
+日志会打印：
+- 训练：`total_loss/recon_l1/lpips/gan_g/disc_loss/disc_acc/mse/psnr`
+- 评估：`[eval][step=...]`（官方 eval 开启时输出 `psnr/ssim/rfid`）
