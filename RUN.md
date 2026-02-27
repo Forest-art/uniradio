@@ -9,6 +9,7 @@
 训练入口：
 
 - `unirae/train_imagenet100_dynamics.py`
+- 支持本地 DINO 权重：`--encoder_ckpt /path/to/dino.pth`
 
 绘图入口：
 
@@ -87,6 +88,7 @@ bash run_imagenet100_dynamics.sh
 可覆盖参数（示例）：
 ```bash
 HF_DATASET_ID=clane9/imagenet-100 \
+ENCODER_CKPT=/path/to/your/dino_local.pth \
 BATCH_SIZE=32 \
 NUM_WORKERS=8 \
 MAX_STEPS=1000 \
@@ -103,9 +105,47 @@ OUTPUT_ROOT=results/bridge_in100_20260227_1k \
 bash run_imagenet100_dynamics.sh
 ```
 
+`BATCH_SIZE` 语义：
+
+- 单卡（`NUM_GPUS=1`）：`BATCH_SIZE` 就是总 batch size。
+- 多卡（`NUM_GPUS>1`）：`BATCH_SIZE` 是每卡 local batch size，总 batch size = `BATCH_SIZE * NUM_GPUS`。
+
 ---
 
-## 5. Multi-Seed Compare (Recommended for Report)
+## 5. Multi-GPU Run
+
+脚本会在 `NUM_GPUS>1` 时自动走 `torchrun`。
+
+示例（8 卡）：
+```bash
+cd /project/peilab/luxiaocheng/projects/unirae_radio
+source .venv/bin/activate
+
+NUM_GPUS=8 \
+BATCH_SIZE=32 \
+NUM_WORKERS=8 \
+MAX_STEPS=1000 \
+PROBE_UNTIL=1000 \
+PROBE_EVERY=50 \
+EVAL_EVERY=1000 \
+EVAL_MAX_BATCHES=50 \
+EVAL_RFID_NUM_SAMPLES=512 \
+EVAL_RFID_BATCH_SIZE=64 \
+EVAL_RFID_TMP_DIR=/tmp \
+SEED=42 \
+RUN_NAME_PREFIX=in100_grad_dynamics \
+OUTPUT_ROOT=results/bridge_in100_20260227_1k \
+bash run_imagenet100_dynamics.sh
+```
+
+若端口冲突可改：
+```bash
+MASTER_PORT=29601 NUM_GPUS=8 bash run_imagenet100_dynamics.sh
+```
+
+---
+
+## 6. Multi-Seed Compare (Recommended for Report)
 
 建议 3 seeds: `42,43,44`
 ```bash
@@ -133,7 +173,7 @@ done
 
 ---
 
-## 6. Plot Publication-Style Figures
+## 7. Plot Publication-Style Figures
 
 ```bash
 cd /project/peilab/luxiaocheng/projects/unirae_radio
@@ -162,7 +202,7 @@ python -m unirae.plot_imagenet100_dynamics_pub \
 
 ---
 
-## 7. Quick Read of Loss Curves
+## 8. Quick Read of Loss Curves
 
 如果只想快速看 loss 数字（不看图）：
 ```bash
@@ -176,20 +216,20 @@ PY
 
 ---
 
-## 8. Slurm Example (HKUST SuperPOD)
+## 9. Slurm Example (HKUST SuperPOD)
 
 推荐先拿 1 卡交互资源：
 ```bash
 srun --partition preempt --account=peilab --nodes=1 --ntasks=1 --cpus-per-task=8 --gpus-per-node=1 --time 0-6:00:00 --pty bash
 ```
 
-进入后再执行第 4/5 节命令。
+进入后再执行第 4/5/6 节命令。
 
 ---
 
-## 9. Troubleshooting
+## 10. Troubleshooting
 
-### 9.1 HuggingFace cache path / disk pressure
+### 10.1 HuggingFace cache path / disk pressure
 若 `/project` 空间紧张，可把 HF cache 临时切到 `/tmp`：
 ```bash
 export HF_HOME=/tmp/hf_home
@@ -201,13 +241,13 @@ export HF_DATASETS_CACHE=/tmp/hf_cache
 export EVAL_RFID_TMP_DIR=/tmp
 ```
 
-### 9.2 Output overwrite
+### 10.2 Output overwrite
 请确保 `SEED` 或 `RUN_NAME_PREFIX` 不同，否则可能覆盖旧 run。
 
-### 9.3 GPU OOM
+### 10.3 GPU OOM
 先把 `BATCH_SIZE` 从 `32` 降到 `16` 或 `8`。
 
-### 9.4 rFID 太慢
+### 10.4 rFID 太慢
 可以减小 `EVAL_RFID_NUM_SAMPLES`（例如 `256`），或临时关闭：
 ```bash
 SKIP_RFID=1 bash run_imagenet100_dynamics.sh

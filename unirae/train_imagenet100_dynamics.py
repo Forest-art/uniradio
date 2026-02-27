@@ -1,15 +1,20 @@
 import argparse
 import csv
+import os
 import tempfile
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import timm
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from datasets import Dataset, DatasetDict, load_dataset
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torchvision import transforms
 from torchvision.utils import save_image
 from tqdm import tqdm
@@ -96,6 +101,9 @@ def build_imagenet100_dataloaders(
     cache_dir: Optional[str] = None,
     image_key: str = "image",
     label_key: str = "label",
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> Tuple[DataLoader, DataLoader, Dict[str, object]]:
     """直接从 Hugging Face 加载 ImageNet-100 并返回 train/val dataloader。
 
@@ -162,10 +170,21 @@ def build_imagenet100_dataloaders(
             )
             num_classes = _infer_num_classes(ds_all[train_split], label_key=label_key)
 
+            train_sampler = None
+            if distributed:
+                train_sampler = DistributedSampler(
+                    train_ds,
+                    num_replicas=int(world_size),
+                    rank=int(rank),
+                    shuffle=True,
+                    drop_last=True,
+                )
+
             train_loader = DataLoader(
                 train_ds,
                 batch_size=int(batch_size),
-                shuffle=True,
+                shuffle=(train_sampler is None),
+                sampler=train_sampler,
                 num_workers=int(num_workers),
                 pin_memory=True,
                 drop_last=True,
@@ -187,6 +206,9 @@ def build_imagenet100_dataloaders(
                 "num_classes": int(num_classes),
                 "train_size": int(len(train_ds)),
                 "val_size": int(len(val_ds)),
+                "distributed": bool(distributed),
+                "rank": int(rank),
+                "world_size": int(world_size),
             }
             return train_loader, val_loader, meta
         except Exception as e:  # noqa: BLE001
@@ -350,7 +372,76 @@ class ViTBridgeModel(nn.Module):
         }
 
 
-def build_encoder(encoder_init: str, image_size: int = 224) -> nn.Module:
+def _extract_state_dict_from_checkpoint(ckpt_obj: object) -> Dict[str, torch.Tensor]:
+    if isinstance(ckpt_obj, dict):
+        for key in ("state_dict", "model", "teacher", "student", "network", "module"):
+            v = ckpt_obj.get(key)
+            if isinstance(v, dict):
+                return v
+        if all(isinstance(k, str) for k in ckpt_obj.keys()):
+            return ckpt_obj  # 直接就是 state_dict
+    raise RuntimeError("Cannot extract state_dict from checkpoint object.")
+
+
+def _best_prefix_stripped_state_dict(
+    state_dict: Dict[str, torch.Tensor],
+    model_state_keys: Sequence[str],
+) -> Dict[str, torch.Tensor]:
+    model_key_set = set(model_state_keys)
+    prefixes = [
+        "",
+        "module.",
+        "model.",
+        "teacher.",
+        "student.",
+        "backbone.",
+        "encoder.",
+        "base_model.",
+        "trunk.",
+    ]
+    best_sd = state_dict
+    best_score = -1
+    for prefix in prefixes:
+        if prefix:
+            cand = {
+                (k[len(prefix) :] if k.startswith(prefix) else k): v
+                for k, v in state_dict.items()
+            }
+        else:
+            cand = state_dict
+        score = sum(1 for k in cand.keys() if k in model_key_set)
+        if score > best_score:
+            best_score = score
+            best_sd = cand
+    return best_sd
+
+
+def _load_local_encoder_checkpoint(encoder: nn.Module, ckpt_path: str) -> None:
+    path = Path(ckpt_path).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"encoder_ckpt not found: {path}")
+
+    ckpt = torch.load(str(path), map_location="cpu", weights_only=False)
+    raw_sd = _extract_state_dict_from_checkpoint(ckpt)
+    sd = _best_prefix_stripped_state_dict(raw_sd, list(encoder.state_dict().keys()))
+    load_ret = encoder.load_state_dict(sd, strict=False)
+
+    matched = 0
+    for k, v in sd.items():
+        if k in encoder.state_dict() and tuple(v.shape) == tuple(encoder.state_dict()[k].shape):
+            matched += 1
+    if matched <= 0:
+        raise RuntimeError(
+            f"Loaded 0 matched keys from local checkpoint: {path}. "
+            "Please check model variant and checkpoint key format."
+        )
+    print(
+        f"[encoder_ckpt] loaded={path} matched={matched} "
+        f"missing={len(load_ret.missing_keys)} unexpected={len(load_ret.unexpected_keys)}"
+    )
+
+
+def build_encoder(encoder_init: str, image_size: int = 224, encoder_ckpt: str = "") -> nn.Module:
     mode = str(encoder_init).lower()
     if mode not in {"scratch", "dinov2"}:
         raise ValueError(f"encoder_init must be scratch|dinov2, got: {encoder_init}")
@@ -358,11 +449,13 @@ def build_encoder(encoder_init: str, image_size: int = 224) -> nn.Module:
     # 同一架构下控制变量：scratch 与 dinov2 仅初始化权重来源不同。
     encoder = timm.create_model(
         "vit_small_patch14_dinov2",
-        pretrained=(mode == "dinov2"),
+        pretrained=(mode == "dinov2" and not bool(str(encoder_ckpt).strip())),
         num_classes=0,
         global_pool="",
         img_size=int(image_size),
     )
+    if mode == "dinov2" and bool(str(encoder_ckpt).strip()):
+        _load_local_encoder_checkpoint(encoder, str(encoder_ckpt).strip())
     # 本实验要求全量微调，因此 encoder 参数全部 trainable。
     for p in encoder.parameters():
         p.requires_grad = True
@@ -616,9 +709,37 @@ def evaluate_recon_and_understanding(
     }
 
 
+def _init_distributed() -> Tuple[bool, int, int, int]:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    is_distributed = world_size > 1
+
+    if is_distributed and not dist.is_initialized():
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend, init_method="env://")
+
+    return is_distributed, rank, world_size, local_rank
+
+
+def _reduce_mean_scalar(value: float, device: torch.device, is_distributed: bool, world_size: int) -> float:
+    t = torch.tensor([float(value)], device=device, dtype=torch.float64)
+    if is_distributed:
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        t /= float(world_size)
+    return float(t.item())
+
+
 def main() -> None:
     parser = argparse.ArgumentParser("ImageNet-100 early gradient dynamics bridge experiment")
     parser.add_argument("--encoder_init", type=str, default="scratch", choices=["scratch", "dinov2"])
+    parser.add_argument(
+        "--encoder_ckpt",
+        type=str,
+        default="",
+        help="Optional local .pth/.pt for encoder init. "
+        "When set with --encoder_init dinov2, load local checkpoint instead of timm online pretrained.",
+    )
     parser.add_argument("--hf_dataset_id", type=str, default="clane9/imagenet-100")
     parser.add_argument("--cache_dir", type=str, default="")
     parser.add_argument("--image_key", type=str, default="image")
@@ -658,12 +779,27 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    seed_everything(int(args.seed))
+    is_distributed, rank, world_size, local_rank = _init_distributed()
+    is_main_process = rank == 0
 
-    if args.device == "auto":
+    seed_everything(int(args.seed) + int(rank))
+
+    if is_distributed and args.device == "cpu" and torch.cuda.is_available():
+        raise RuntimeError(
+            "Distributed launch with CUDA available does not support --device=cpu. "
+            "Use --device=auto or --device=cuda."
+        )
+    if args.device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("--device=cuda is set but CUDA is not available.")
+    if is_distributed and torch.cuda.is_available() and args.device != "cpu":
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+    elif args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device(args.device)
+    if is_distributed and is_main_process and device.type == "cpu":
+        print("[warn] running distributed training on CPU backend, this is usually very slow.")
 
     train_loader, val_loader, data_meta = build_imagenet100_dataloaders(
         batch_size=int(args.batch_size),
@@ -672,9 +808,16 @@ def main() -> None:
         cache_dir=(str(args.cache_dir) if args.cache_dir else None),
         image_key=str(args.image_key),
         label_key=str(args.label_key),
+        distributed=is_distributed,
+        rank=rank,
+        world_size=world_size,
     )
 
-    encoder = build_encoder(args.encoder_init, image_size=224)
+    encoder = build_encoder(
+        args.encoder_init,
+        image_size=224,
+        encoder_ckpt=str(args.encoder_ckpt),
+    )
     model = ViTBridgeModel(
         encoder=encoder,
         num_classes=int(data_meta["num_classes"]),
@@ -685,6 +828,17 @@ def main() -> None:
         decoder_mlp_ratio=float(args.decoder_mlp_ratio),
         decoder_drop_rate=float(args.decoder_drop_rate),
     ).to(device)
+    if is_distributed:
+        if device.type == "cuda":
+            model = DDP(
+                model,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                broadcast_buffers=False,
+            )
+        else:
+            model = DDP(model, broadcast_buffers=False)
+    base_model = model.module if isinstance(model, DDP) else model
     model.train()
 
     # 统一输入已在 dataloader 做过 Normalize，这里仅用于必要时重建 target 反归一化。
@@ -701,29 +855,43 @@ def main() -> None:
     run_name = str(args.run_name).strip() or f"in100_grad_dynamics_{args.encoder_init}"
     run_dir = Path(args.output_root) / run_name
     ensure_dir(str(run_dir))
-    save_json(
-        {
-            "args": vars(args),
-            "data_meta": data_meta,
-            "device": str(device),
-            "num_trainable_params": int(sum(p.numel() for p in model.parameters() if p.requires_grad)),
-            "num_train_samples": int(len(train_loader.dataset)),
-            "num_val_samples": int(len(val_loader.dataset)),
-        },
-        str(run_dir / "run_setup.json"),
-    )
+    if is_main_process:
+        save_json(
+            {
+                "args": vars(args),
+                "data_meta": data_meta,
+                "device": str(device),
+                "rank": int(rank),
+                "world_size": int(world_size),
+                "num_trainable_params": int(sum(p.numel() for p in model.parameters() if p.requires_grad)),
+                "num_train_samples": int(len(train_loader.dataset)),
+                "num_val_samples": int(len(val_loader.dataset)),
+            },
+            str(run_dir / "run_setup.json"),
+        )
 
     metrics_path = run_dir / "train_metrics.jsonl"
     eval_metrics_path = run_dir / "eval_metrics.jsonl"
-    encoder_groups = _group_encoder_params(model.encoder)
+    encoder_groups = _group_encoder_params(base_model.encoder)
     global_step = 0
+    train_epoch = 0
+    train_sampler = train_loader.sampler if isinstance(train_loader.sampler, DistributedSampler) else None
+    if train_sampler is not None:
+        train_sampler.set_epoch(train_epoch)
     train_iter = iter(train_loader)
-    pbar = tqdm(total=int(args.max_steps), desc=f"in100-{args.encoder_init}", dynamic_ncols=True)
+    pbar = (
+        tqdm(total=int(args.max_steps), desc=f"in100-{args.encoder_init}", dynamic_ncols=True)
+        if is_main_process
+        else None
+    )
 
     while global_step < int(args.max_steps):
         try:
             images, labels = next(train_iter)
         except StopIteration:
+            train_epoch += 1
+            if train_sampler is not None:
+                train_sampler.set_epoch(train_epoch)
             train_iter = iter(train_loader)
             images, labels = next(train_iter)
 
@@ -736,7 +904,7 @@ def main() -> None:
         outputs = model(images)
         logits = outputs["logits"]
         pred_patches = outputs["pred_patches"]
-        gt_patches = model.patchify(images_01)
+        gt_patches = base_model.patchify(images_01)
 
         loss_u = F.cross_entropy(logits, labels)
         loss_g = F.mse_loss(pred_patches, gt_patches)
@@ -750,17 +918,20 @@ def main() -> None:
         optimizer.zero_grad(set_to_none=True)
         probe_stats: Optional[Dict[str, float]] = None
 
-        if should_probe:
+        if should_probe and is_main_process:
+            sync_context = model.no_sync if isinstance(model, DDP) else nullcontext
             # 1) L_U.backward(retain_graph=True)，抽取 encoder 各层 g_u。
-            loss_u.backward(retain_graph=True)
-            dict_gu = _clone_encoder_grads(model.encoder)
+            with sync_context():
+                loss_u.backward(retain_graph=True)
+            dict_gu = _clone_encoder_grads(base_model.encoder)
 
             # 2) 清空梯度，防止污染下一次 backward。
             optimizer.zero_grad(set_to_none=True)
 
             # 3) L_G.backward(retain_graph=True)，抽取 encoder 各层 g_g。
-            loss_g.backward(retain_graph=True)
-            dict_gg = _clone_encoder_grads(model.encoder)
+            with sync_context():
+                loss_g.backward(retain_graph=True)
+            dict_gg = _clone_encoder_grads(base_model.encoder)
 
             # 4) 再清空梯度后，仅做日志统计，不把 probe 梯度带入优化。
             optimizer.zero_grad(set_to_none=True)
@@ -783,15 +954,21 @@ def main() -> None:
             acc = (logits.argmax(dim=-1) == labels).float().mean()
             rmse = torch.sqrt(loss_g.detach().clamp_min(0.0))
 
+        loss_u_log = _reduce_mean_scalar(float(loss_u.detach().item()), device, is_distributed, world_size)
+        loss_g_log = _reduce_mean_scalar(float(loss_g.detach().item()), device, is_distributed, world_size)
+        loss_total_log = _reduce_mean_scalar(float(total_loss.detach().item()), device, is_distributed, world_size)
+        acc_log = _reduce_mean_scalar(float(acc.item()), device, is_distributed, world_size)
+        rmse_log = _reduce_mean_scalar(float(rmse.item()), device, is_distributed, world_size)
+
         row = {
             "step": int(global_step),
-            "loss_u": float(loss_u.detach().item()),
-            "loss_g": float(loss_g.detach().item()),
-            "loss_total": float(total_loss.detach().item()),
-            "acc": float(acc.item()),
-            "rmse": float(rmse.item()),
+            "loss_u": float(loss_u_log),
+            "loss_g": float(loss_g_log),
+            "loss_total": float(loss_total_log),
+            "acc": float(acc_log),
+            "rmse": float(rmse_log),
         }
-        if probe_stats is not None:
+        if is_main_process and probe_stats is not None:
             row["probe_mean_cosine"] = float(probe_stats["mean_cosine"])
             row["probe_mean_neg_ratio"] = float(probe_stats["mean_neg_ratio"])
             row["probe_csv"] = str(probe_stats["csv_path"])
@@ -800,59 +977,71 @@ def main() -> None:
                 f"mean_neg_ratio={probe_stats['mean_neg_ratio']:.4f} csv={probe_stats['csv_path']}"
             )
 
-        append_jsonl(str(metrics_path), row)
-        pbar.update(1)
-        if (global_step == 1) or (global_step % int(args.log_every) == 0) or (global_step == int(args.max_steps)):
-            pbar.set_postfix(
-                lu=f"{row['loss_u']:.4f}",
-                lg=f"{row['loss_g']:.4f}",
-                acc=f"{row['acc']:.3f}",
-                rmse=f"{row['rmse']:.4f}",
-            )
+        if is_main_process:
+            append_jsonl(str(metrics_path), row)
+            if pbar is not None:
+                pbar.update(1)
+                if (global_step == 1) or (global_step % int(args.log_every) == 0) or (
+                    global_step == int(args.max_steps)
+                ):
+                    pbar.set_postfix(
+                        lu=f"{row['loss_u']:.4f}",
+                        lg=f"{row['loss_g']:.4f}",
+                        acc=f"{row['acc']:.3f}",
+                        rmse=f"{row['rmse']:.4f}",
+                    )
 
         if int(args.eval_every) > 0 and (
             global_step % int(args.eval_every) == 0 or global_step == int(args.max_steps)
         ):
-            eval_ret = evaluate_recon_and_understanding(
-                model=model,
-                val_loader=val_loader,
-                device=device,
-                mean=mean,
-                std=std,
-                max_batches=int(args.eval_max_batches),
-                compute_rfid=(not bool(args.skip_rfid)),
-                rfid_num_samples=int(args.eval_rfid_num_samples),
-                rfid_batch_size=int(args.eval_rfid_batch_size),
-                rfid_tmp_dir=str(args.eval_rfid_tmp_dir),
-            )
-            eval_row = {"step": int(global_step), **eval_ret}
-            append_jsonl(str(eval_metrics_path), eval_row)
-            print(
-                "[eval] step={} acc={:.4f} rMSE={:.6f} rFID={:.4f} n={} rfid_n={}".format(
-                    int(global_step),
-                    float(eval_ret["val_top1_acc"]),
-                    float(eval_ret["val_rmse"]),
-                    float(eval_ret["val_rfid"]),
-                    int(eval_ret["val_num_samples"]),
-                    int(eval_ret["rfid_num_samples"]),
+            if is_main_process:
+                eval_ret = evaluate_recon_and_understanding(
+                    model=base_model,
+                    val_loader=val_loader,
+                    device=device,
+                    mean=mean,
+                    std=std,
+                    max_batches=int(args.eval_max_batches),
+                    compute_rfid=(not bool(args.skip_rfid)),
+                    rfid_num_samples=int(args.eval_rfid_num_samples),
+                    rfid_batch_size=int(args.eval_rfid_batch_size),
+                    rfid_tmp_dir=str(args.eval_rfid_tmp_dir),
                 )
-            )
-            if eval_ret.get("rfid_error"):
-                print(f"[eval][rfid_error] {eval_ret['rfid_error']}")
+                eval_row = {"step": int(global_step), **eval_ret}
+                append_jsonl(str(eval_metrics_path), eval_row)
+                print(
+                    "[eval] step={} acc={:.4f} rMSE={:.6f} rFID={:.4f} n={} rfid_n={}".format(
+                        int(global_step),
+                        float(eval_ret["val_top1_acc"]),
+                        float(eval_ret["val_rmse"]),
+                        float(eval_ret["val_rfid"]),
+                        int(eval_ret["val_num_samples"]),
+                        int(eval_ret["rfid_num_samples"]),
+                    )
+                )
+                if eval_ret.get("rfid_error"):
+                    print(f"[eval][rfid_error] {eval_ret['rfid_error']}")
+            if is_distributed:
+                dist.barrier()
             model.train()
 
-    pbar.close()
-    torch.save(
-        {
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "step": int(global_step),
-            "args": vars(args),
-            "data_meta": data_meta,
-        },
-        str(run_dir / "latest.pt"),
-    )
-    print(f"[done] output={run_dir}")
+    if pbar is not None:
+        pbar.close()
+    if is_main_process:
+        torch.save(
+            {
+                "model": base_model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "step": int(global_step),
+                "args": vars(args),
+                "data_meta": data_meta,
+            },
+            str(run_dir / "latest.pt"),
+        )
+        print(f"[done] output={run_dir}")
+    if is_distributed:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

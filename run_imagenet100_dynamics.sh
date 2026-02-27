@@ -4,12 +4,15 @@ set -euo pipefail
 # 用法:
 #   bash run_imagenet100_dynamics.sh
 # 可通过环境变量覆盖默认参数，例如:
-#   HF_DATASET_ID=clane9/imagenet-100 BATCH_SIZE=64 MAX_STEPS=1200 bash run_imagenet100_dynamics.sh
+#   NUM_GPUS=8 ENCODER_CKPT=/path/to/dino.pth HF_DATASET_ID=clane9/imagenet-100 BATCH_SIZE=32 MAX_STEPS=1200 bash run_imagenet100_dynamics.sh
 
 HF_DATASET_ID="${HF_DATASET_ID:-clane9/imagenet-100}"
 CACHE_DIR="${CACHE_DIR:-}"
+ENCODER_CKPT="${ENCODER_CKPT:-}"
 BATCH_SIZE="${BATCH_SIZE:-128}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
+NUM_GPUS="${NUM_GPUS:-1}"
+MASTER_PORT="${MASTER_PORT:-29500}"
 MAX_STEPS="${MAX_STEPS:-1200}"
 PROBE_UNTIL="${PROBE_UNTIL:-1000}"
 PROBE_EVERY="${PROBE_EVERY:-50}"
@@ -46,21 +49,35 @@ COMMON_ARGS=(
 if [[ -n "${CACHE_DIR}" ]]; then
   COMMON_ARGS+=(--cache_dir "${CACHE_DIR}")
 fi
+if [[ -n "${ENCODER_CKPT}" ]]; then
+  COMMON_ARGS+=(--encoder_ckpt "${ENCODER_CKPT}")
+fi
 if [[ "${SKIP_RFID}" == "1" ]]; then
   COMMON_ARGS+=(--skip_rfid)
 fi
 
-echo "[run] scratch"
-python -m unirae.train_imagenet100_dynamics \
-  --encoder_init scratch \
-  --run_name "${RUN_NAME_PREFIX}_scratch_s${SEED}" \
-  "${COMMON_ARGS[@]}"
+run_one() {
+  local init_mode="$1"
+  local run_name="${RUN_NAME_PREFIX}_${init_mode}_s${SEED}"
 
-echo "[run] dinov2"
-python -m unirae.train_imagenet100_dynamics \
-  --encoder_init dinov2 \
-  --run_name "${RUN_NAME_PREFIX}_dinov2_s${SEED}" \
-  "${COMMON_ARGS[@]}"
+  if [[ "${NUM_GPUS}" -gt 1 ]]; then
+    echo "[run][ddp:${NUM_GPUS}gpus] ${init_mode}"
+    torchrun --standalone --nproc_per_node="${NUM_GPUS}" --master_port="${MASTER_PORT}" \
+      -m unirae.train_imagenet100_dynamics \
+      --encoder_init "${init_mode}" \
+      --run_name "${run_name}" \
+      "${COMMON_ARGS[@]}"
+  else
+    echo "[run][single] ${init_mode}"
+    python -m unirae.train_imagenet100_dynamics \
+      --encoder_init "${init_mode}" \
+      --run_name "${run_name}" \
+      "${COMMON_ARGS[@]}"
+  fi
+}
+
+run_one scratch
+run_one dinov2
 
 echo "[done] outputs:"
 echo "  ${OUTPUT_ROOT}/${RUN_NAME_PREFIX}_scratch_s${SEED}"
