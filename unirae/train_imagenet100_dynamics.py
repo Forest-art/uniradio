@@ -2,7 +2,6 @@ import argparse
 import csv
 import os
 import tempfile
-from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -497,15 +496,25 @@ def _group_encoder_params(encoder: nn.Module) -> List[Tuple[str, int, List[Tuple
     return merged
 
 
-def _clone_encoder_grads(encoder: nn.Module) -> Dict[str, torch.Tensor]:
+def _autograd_grads_by_name(
+    loss: torch.Tensor,
+    named_params: List[Tuple[str, nn.Parameter]],
+    retain_graph: bool,
+) -> Dict[str, torch.Tensor]:
+    params = [p for _, p in named_params]
+    grads = torch.autograd.grad(
+        loss,
+        params,
+        retain_graph=retain_graph,
+        create_graph=False,
+        allow_unused=True,
+    )
     out: Dict[str, torch.Tensor] = {}
-    for name, p in encoder.named_parameters():
-        if not p.requires_grad:
-            continue
-        if p.grad is None:
+    for (name, p), g in zip(named_params, grads):
+        if g is None:
             out[name] = torch.zeros_like(p, memory_format=torch.preserve_format).detach().clone()
         else:
-            out[name] = p.grad.detach().clone()
+            out[name] = g.detach().clone()
     return out
 
 
@@ -919,22 +928,27 @@ def main() -> None:
         probe_stats: Optional[Dict[str, float]] = None
 
         if should_probe and is_main_process:
-            sync_context = model.no_sync if isinstance(model, DDP) else nullcontext
-            # 1) L_U.backward(retain_graph=True)，抽取 encoder 各层 g_u。
-            with sync_context():
-                loss_u.backward(retain_graph=True)
-            dict_gu = _clone_encoder_grads(base_model.encoder)
-
-            # 2) 清空梯度，防止污染下一次 backward。
-            optimizer.zero_grad(set_to_none=True)
-
-            # 3) L_G.backward(retain_graph=True)，抽取 encoder 各层 g_g。
-            with sync_context():
-                loss_g.backward(retain_graph=True)
-            dict_gg = _clone_encoder_grads(base_model.encoder)
-
-            # 4) 再清空梯度后，仅做日志统计，不把 probe 梯度带入优化。
-            optimizer.zero_grad(set_to_none=True)
+            # DDP 下探针梯度不能用多次 backward（会触发 mark ready twice）。
+            # 这里单独走 base_model 前向 + autograd.grad，只做梯度观测，不写入 .grad。
+            probe_outputs = base_model(images)
+            probe_logits = probe_outputs["logits"]
+            probe_pred_patches = probe_outputs["pred_patches"]
+            probe_gt_patches = base_model.patchify(images_01)
+            probe_loss_u = F.cross_entropy(probe_logits, labels)
+            probe_loss_g = F.mse_loss(probe_pred_patches, probe_gt_patches)
+            enc_named_params = [
+                (n, p) for n, p in base_model.encoder.named_parameters() if p.requires_grad
+            ]
+            dict_gu = _autograd_grads_by_name(
+                probe_loss_u,
+                enc_named_params,
+                retain_graph=True,
+            )
+            dict_gg = _autograd_grads_by_name(
+                probe_loss_g,
+                enc_named_params,
+                retain_graph=False,
+            )
             probe_stats = save_layerwise_conflict_csv(
                 step=global_step,
                 dict_gu=dict_gu,
@@ -943,7 +957,7 @@ def main() -> None:
                 out_dir=run_dir,
             )
 
-            # 5) 恢复正常联合更新：(L_U + L_G).backward() -> step。
+            # 正常联合更新仍保持一次 backward。
             total_loss.backward()
         else:
             total_loss.backward()
