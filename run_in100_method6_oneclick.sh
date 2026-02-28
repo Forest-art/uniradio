@@ -24,6 +24,8 @@ Optional env vars:
   RUN_GROUP=in100_method6_YYYYmmdd_HHMMSS
   METHODS="und_only gen_only joint pcgrad cagrad lacar"
   DATA_MODE=auto               # auto | path | hf
+  ENCODER_INIT=dinov2          # dinov2 | scratch
+  ENCODER_CKPT=/path/to/dino.pth  # optional, only used when ENCODER_INIT=dinov2
   PYTHON_BIN=python
   TORCHRUN_BIN=torchrun
   ENABLE_FINAL_RFID=1         # 1: compute final rFID, 0: disable
@@ -50,6 +52,8 @@ RUN_GROUP=${RUN_GROUP:-in100_method6_$(date +%Y%m%d_%H%M%S)}
 METHODS=${METHODS:-"und_only gen_only joint pcgrad cagrad lacar"}
 ENABLE_FINAL_RFID=${ENABLE_FINAL_RFID:-1}
 DATA_MODE=${DATA_MODE:-auto}
+ENCODER_INIT=${ENCODER_INIT:-dinov2}
+ENCODER_CKPT=${ENCODER_CKPT:-}
 
 if ! command -v "$TORCHRUN_BIN" >/dev/null 2>&1; then
   echo "[warn] $TORCHRUN_BIN not found, fallback to: $PYTHON_BIN -m torch.distributed.run"
@@ -92,7 +96,7 @@ fi
 # 统一公共参数，保证公平对比。
 COMMON_ARGS=(
   -m unirae.train_imagenet100_methods
-  --encoder_init dinov2
+  --encoder_init "$ENCODER_INIT"
   "${DATA_ARGS[@]}"
   --batch_size "$BATCH_SIZE_PER_GPU"
   --num_workers "$NUM_WORKERS"
@@ -110,6 +114,9 @@ COMMON_ARGS=(
   --output_root "$RUN_ROOT"
   --device auto
 )
+if [[ "$ENCODER_INIT" == "dinov2" && -n "$ENCODER_CKPT" ]]; then
+  COMMON_ARGS+=(--encoder_ckpt "$ENCODER_CKPT")
+fi
 
 if [[ "$ENABLE_FINAL_RFID" == "1" ]]; then
   COMMON_ARGS+=(--final_eval_rfid)
@@ -118,6 +125,10 @@ else
 fi
 
 echo "[start] RUN_GROUP=${RUN_GROUP}"
+echo "[start] ENCODER_INIT=${ENCODER_INIT}"
+if [[ "$ENCODER_INIT" == "dinov2" && -n "$ENCODER_CKPT" ]]; then
+  echo "[start] ENCODER_CKPT=${ENCODER_CKPT}"
+fi
 echo "[start] DATA_MODE=${DATA_MODE}"
 if [[ "$DATA_MODE" == "local_path" ]]; then
   echo "[start] DATASET_PATH=${DATASET_PATH}"
