@@ -4,11 +4,12 @@ set -euo pipefail
 if [[ $# -lt 1 ]]; then
   cat <<'EOF'
 Usage:
-  bash run_in100_method6_oneclick.sh /path/to/in100
+  bash run_in100_method6_oneclick.sh <dataset_path_or_hf_dataset_id>
 
-Dataset path supports:
+Input supports:
   1) ImageFolder style: <root>/train, <root>/val (or validation)
   2) HF load_from_disk directory: contains dataset_dict.json / dataset_info.json
+  3) HF dataset id for online load_dataset (e.g. clane9/imagenet-100)
 
 Optional env vars:
   NPROC_PER_NODE=8            # number of GPUs to use on this node
@@ -28,11 +29,7 @@ EOF
   exit 1
 fi
 
-DATASET_PATH="$1"
-if [[ ! -e "$DATASET_PATH" ]]; then
-  echo "[error] dataset_path not found: $DATASET_PATH" >&2
-  exit 1
-fi
+DATASET_INPUT="$1"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -61,11 +58,23 @@ fi
 RUN_ROOT="${OUTPUT_ROOT}/${RUN_GROUP}"
 mkdir -p "$RUN_ROOT"
 
+# 统一数据输入：本地路径优先，否则按 HF dataset id 处理。
+DATA_ARGS=()
+if [[ -e "$DATASET_INPUT" ]]; then
+  DATASET_PATH="$DATASET_INPUT"
+  DATA_ARGS+=(--dataset_path "$DATASET_PATH")
+  DATA_MODE="local_path"
+else
+  HF_DATASET_ID="$DATASET_INPUT"
+  DATA_ARGS+=(--hf_dataset_id "$HF_DATASET_ID")
+  DATA_MODE="hf_load_dataset"
+fi
+
 # 统一公共参数，保证公平对比。
 COMMON_ARGS=(
   -m unirae.train_imagenet100_methods
   --encoder_init dinov2
-  --dataset_path "$DATASET_PATH"
+  "${DATA_ARGS[@]}"
   --batch_size "$BATCH_SIZE_PER_GPU"
   --num_workers "$NUM_WORKERS"
   --max_steps "$MAX_STEPS"
@@ -90,7 +99,12 @@ else
 fi
 
 echo "[start] RUN_GROUP=${RUN_GROUP}"
-echo "[start] DATASET_PATH=${DATASET_PATH}"
+echo "[start] DATA_MODE=${DATA_MODE}"
+if [[ "$DATA_MODE" == "local_path" ]]; then
+  echo "[start] DATASET_PATH=${DATASET_PATH}"
+else
+  echo "[start] HF_DATASET_ID=${HF_DATASET_ID}"
+fi
 echo "[start] NPROC_PER_NODE=${NPROC_PER_NODE}, BATCH_SIZE_PER_GPU=${BATCH_SIZE_PER_GPU}, GLOBAL_BATCH=$((NPROC_PER_NODE * BATCH_SIZE_PER_GPU))"
 echo "[start] OUTPUT_ROOT=${RUN_ROOT}"
 
