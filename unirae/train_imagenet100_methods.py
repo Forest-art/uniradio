@@ -13,7 +13,43 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from .grad_conflict import apply_cagrad, apply_conflict_aware, apply_naive
-from .losses import FeatureVarianceLoss
+try:
+    from .losses import FeatureVarianceLoss
+except Exception:  # noqa: BLE001
+    class FeatureVarianceLoss(nn.Module):
+        """Fallback VICReg-style variance regularization.
+
+        Some clusters may run an older `unirae.losses` that does not expose
+        FeatureVarianceLoss yet; keep the training entry self-contained.
+        """
+
+        def __init__(self, gamma: float = 1.0, eps: float = 1e-4):
+            super().__init__()
+            self.gamma = float(gamma)
+            self.eps = float(eps)
+
+        def forward(self, features: torch.Tensor) -> torch.Tensor:
+            if features.ndim == 4:
+                x = F.adaptive_avg_pool2d(features, output_size=(1, 1)).flatten(1)
+            elif features.ndim == 2:
+                x = features
+            else:
+                raise ValueError(
+                    f"FeatureVarianceLoss expects [B, D] or [B, C, H, W], got shape={tuple(features.shape)}"
+                )
+
+            bsz, dim = x.shape
+            if dim <= 0:
+                raise ValueError("FeatureVarianceLoss got empty feature dimension.")
+
+            x_centered = x - x.mean(dim=0, keepdim=True)
+            if bsz > 1:
+                var = (x_centered * x_centered).sum(dim=0) / float(bsz - 1)
+            else:
+                var = x.new_zeros((dim,))
+
+            std = torch.sqrt(var + self.eps)
+            return torch.relu(self.gamma - std).mean()
 from .train_imagenet100_dynamics import (
     IMAGENET_MEAN,
     IMAGENET_STD,
