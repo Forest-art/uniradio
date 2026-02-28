@@ -5,6 +5,7 @@ if [[ $# -lt 1 ]]; then
   cat <<'EOF'
 Usage:
   bash run_in100_method6_oneclick.sh <dataset_path_or_hf_dataset_id>
+  bash run_in100_method6_oneclick.sh hf:clane9/imagenet-100
 
 Input supports:
   1) ImageFolder style: <root>/train, <root>/val (or validation)
@@ -22,6 +23,7 @@ Optional env vars:
   OUTPUT_ROOT=results/in100_method6_runs
   RUN_GROUP=in100_method6_YYYYmmdd_HHMMSS
   METHODS="und_only gen_only joint pcgrad cagrad lacar"
+  DATA_MODE=auto               # auto | path | hf
   PYTHON_BIN=python
   TORCHRUN_BIN=torchrun
   ENABLE_FINAL_RFID=1         # 1: compute final rFID, 0: disable
@@ -47,6 +49,7 @@ OUTPUT_ROOT=${OUTPUT_ROOT:-results/in100_method6_runs}
 RUN_GROUP=${RUN_GROUP:-in100_method6_$(date +%Y%m%d_%H%M%S)}
 METHODS=${METHODS:-"und_only gen_only joint pcgrad cagrad lacar"}
 ENABLE_FINAL_RFID=${ENABLE_FINAL_RFID:-1}
+DATA_MODE=${DATA_MODE:-auto}
 
 if ! command -v "$TORCHRUN_BIN" >/dev/null 2>&1; then
   echo "[warn] $TORCHRUN_BIN not found, fallback to: $PYTHON_BIN -m torch.distributed.run"
@@ -60,7 +63,23 @@ mkdir -p "$RUN_ROOT"
 
 # 统一数据输入：本地路径优先，否则按 HF dataset id 处理。
 DATA_ARGS=()
-if [[ -e "$DATASET_INPUT" ]]; then
+if [[ "$DATASET_INPUT" == hf:* ]]; then
+  HF_DATASET_ID="${DATASET_INPUT#hf:}"
+  DATA_ARGS+=(--hf_dataset_id "$HF_DATASET_ID")
+  DATA_MODE="hf_load_dataset"
+elif [[ "$DATA_MODE" == "hf" ]]; then
+  HF_DATASET_ID="$DATASET_INPUT"
+  DATA_ARGS+=(--hf_dataset_id "$HF_DATASET_ID")
+  DATA_MODE="hf_load_dataset"
+elif [[ "$DATA_MODE" == "path" ]]; then
+  if [[ ! -e "$DATASET_INPUT" ]]; then
+    echo "[error] DATA_MODE=path but input path not found: $DATASET_INPUT" >&2
+    exit 1
+  fi
+  DATASET_PATH="$DATASET_INPUT"
+  DATA_ARGS+=(--dataset_path "$DATASET_PATH")
+  DATA_MODE="local_path"
+elif [[ -e "$DATASET_INPUT" ]]; then
   DATASET_PATH="$DATASET_INPUT"
   DATA_ARGS+=(--dataset_path "$DATASET_PATH")
   DATA_MODE="local_path"
