@@ -10,14 +10,16 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from datasets import Dataset, DatasetDict, load_dataset
+from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torchvision import datasets as tv_datasets
 from torchvision import transforms
 from torchvision.utils import save_image
 from tqdm import tqdm
 
+from .grad_conflict import apply_cagrad, apply_conflict_aware, apply_naive
 from .utils import append_jsonl, ensure_dir, save_json, seed_everything
 
 
@@ -84,6 +86,41 @@ def _pick_split_name(ds: DatasetDict, candidates: Sequence[str]) -> Optional[str
     return keys[0] if len(keys) > 0 else None
 
 
+def _looks_like_hf_disk_dataset(path: Path) -> bool:
+    return any((path / name).exists() for name in ("dataset_info.json", "dataset_dict.json", "state.json"))
+
+
+def _resolve_imagefolder_split_root(data_root: Path, split: str) -> Path:
+    split_alias = {
+        "train": ["train"],
+        "val": ["val", "validation", "valid", "test"],
+        "validation": ["validation", "val", "valid", "test"],
+        "test": ["test", "val", "validation", "valid"],
+    }
+    candidates = split_alias.get(split, [split])
+
+    roots = [data_root]
+    # 兼容常见层级: <root>/imagenet, <root>/ILSVRC/Data/CLS-LOC
+    roots.extend(
+        [
+            data_root / "imagenet",
+            data_root / "ILSVRC" / "Data" / "CLS-LOC",
+        ]
+    )
+
+    for root in roots:
+        for cand in candidates:
+            p = root / cand
+            if p.exists() and p.is_dir():
+                return p
+
+    tried = [str(root / cand) for root in roots for cand in candidates]
+    raise FileNotFoundError(
+        f"Cannot find ImageFolder split='{split}' under data_root={data_root}. "
+        f"Tried: {', '.join(tried)}"
+    )
+
+
 def _infer_num_classes(split_ds: Dataset, label_key: str = "label") -> int:
     feat = getattr(split_ds, "features", {}).get(label_key, None)
     if feat is not None and hasattr(feat, "names") and feat.names is not None:
@@ -96,6 +133,7 @@ def _infer_num_classes(split_ds: Dataset, label_key: str = "label") -> int:
 def build_imagenet100_dataloaders(
     batch_size: int = 128,
     num_workers: int = 8,
+    dataset_path: Optional[str] = None,
     hf_dataset_id: Optional[str] = None,
     cache_dir: Optional[str] = None,
     image_key: str = "image",
@@ -104,9 +142,11 @@ def build_imagenet100_dataloaders(
     rank: int = 0,
     world_size: int = 1,
 ) -> Tuple[DataLoader, DataLoader, Dict[str, object]]:
-    """直接从 Hugging Face 加载 ImageNet-100 并返回 train/val dataloader。
+    """构建 IN100 dataloader。
 
-    注意：不依赖本地 ImageNet-1K 路径，不做本地子集切分。
+    支持两种来源：
+    1) `dataset_path` 本地路径（HF load_from_disk 或 ImageFolder）
+    2) `hf_dataset_id` 远程 HuggingFace 数据集
     """
     candidates = [hf_dataset_id] if hf_dataset_id else []
     # 以 clane9/imagenet-100 为首选，其他作为回退。
@@ -142,6 +182,95 @@ def build_imagenet100_dataloaders(
             transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
         ]
     )
+
+    # 优先使用本地路径，方便跨集群一键复现实验。
+    if dataset_path:
+        ds_root = Path(dataset_path).expanduser()
+        if not ds_root.exists():
+            raise FileNotFoundError(f"dataset_path not found: {ds_root}")
+
+        # A) HF load_from_disk 目录
+        if _looks_like_hf_disk_dataset(ds_root):
+            ds_all = load_from_disk(str(ds_root))
+            if not isinstance(ds_all, DatasetDict):
+                raise TypeError(
+                    f"{ds_root} is not a DatasetDict from load_from_disk. got={type(ds_all)}"
+                )
+
+            train_split = _pick_split_name(ds_all, ["train"])
+            val_split = _pick_split_name(ds_all, ["validation", "val", "test"])
+            if train_split is None or val_split is None:
+                raise RuntimeError(f"{ds_root} has no valid splits. available={list(ds_all.keys())}")
+
+            train_ds = HFImageNet100TorchDataset(
+                ds_all[train_split],
+                transform=train_transform,
+                image_key=image_key,
+                label_key=label_key,
+            )
+            val_ds = HFImageNet100TorchDataset(
+                ds_all[val_split],
+                transform=val_transform,
+                image_key=image_key,
+                label_key=label_key,
+            )
+            num_classes = _infer_num_classes(ds_all[train_split], label_key=label_key)
+            source = "local_hf_disk"
+        else:
+            # B) torchvision ImageFolder 目录
+            train_root = _resolve_imagefolder_split_root(ds_root, "train")
+            val_root = _resolve_imagefolder_split_root(ds_root, "val")
+            train_ds = tv_datasets.ImageFolder(str(train_root), transform=train_transform)
+            val_ds = tv_datasets.ImageFolder(str(val_root), transform=val_transform)
+            num_classes = int(len(train_ds.classes))
+            source = "local_imagefolder"
+            train_split = str(train_root)
+            val_split = str(val_root)
+
+        train_sampler = None
+        if distributed:
+            train_sampler = DistributedSampler(
+                train_ds,
+                num_replicas=int(world_size),
+                rank=int(rank),
+                shuffle=True,
+                drop_last=True,
+            )
+
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=int(batch_size),
+            shuffle=(train_sampler is None),
+            sampler=train_sampler,
+            num_workers=int(num_workers),
+            pin_memory=True,
+            drop_last=True,
+            persistent_workers=int(num_workers) > 0,
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=int(batch_size),
+            shuffle=False,
+            num_workers=int(num_workers),
+            pin_memory=True,
+            drop_last=False,
+            persistent_workers=int(num_workers) > 0,
+        )
+
+        meta = {
+            "dataset_source": source,
+            "dataset_path": str(ds_root),
+            "hf_dataset_id": None,
+            "train_split": train_split,
+            "val_split": val_split,
+            "num_classes": int(num_classes),
+            "train_size": int(len(train_ds)),
+            "val_size": int(len(val_ds)),
+            "distributed": bool(distributed),
+            "rank": int(rank),
+            "world_size": int(world_size),
+        }
+        return train_loader, val_loader, meta
 
     errors: List[str] = []
     for ds_name in ordered_candidates:
@@ -606,6 +735,15 @@ def save_layerwise_conflict_csv(
     }
 
 
+def _global_grad_norm(grads: Dict[str, torch.Tensor]) -> float:
+    s = 0.0
+    for g in grads.values():
+        x = g.detach()
+        # 统一到 fp32 统计，避免 bf16/fp16 下数值抖动。
+        s += float((x.float() * x.float()).sum().item())
+    return float(s**0.5)
+
+
 @torch.no_grad()
 def evaluate_recon_and_understanding(
     *,
@@ -703,6 +841,10 @@ def evaluate_recon_and_understanding(
             rfid = float(ret.get("frechet_inception_distance", float("nan")))
         except Exception as e:  # noqa: BLE001
             rfid_error = str(e)
+            if isinstance(e, ModuleNotFoundError) and "torch_fidelity" in str(e):
+                rfid_error = (
+                    f"{rfid_error}; install with: pip install torch-fidelity"
+                )
 
     if tmp_root is not None:
         tmp_root.cleanup()
@@ -760,6 +902,51 @@ def main() -> None:
     parser.add_argument("--probe_every", type=int, default=50)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight_decay", type=float, default=0.05)
+    parser.add_argument("--lambda_u", type=float, default=1.0)
+    parser.add_argument("--lambda_g", type=float, default=1.0)
+    parser.add_argument(
+        "--grad_strategy",
+        type=str,
+        default="naive",
+        choices=["naive", "pcgrad", "cagrad", "conflict_aware"],
+        help="Gradient merge strategy on shared encoder params for joint optimization.",
+    )
+    parser.add_argument(
+        "--cagrad_beta",
+        type=float,
+        default=0.5,
+        help="CAGrad interpolation strength in [0,1]. Used when --grad_strategy=cagrad.",
+    )
+    parser.add_argument(
+        "--grad_norm_balance_every",
+        type=int,
+        default=0,
+        help="If >0, every N steps estimate encoder gu/gg norms and dynamically scale lambda_g.",
+    )
+    parser.add_argument(
+        "--grad_norm_balance_ema",
+        type=float,
+        default=0.9,
+        help="EMA momentum for dynamic lambda_g scaling when grad_norm_balance_every>0.",
+    )
+    parser.add_argument(
+        "--grad_norm_balance_power",
+        type=float,
+        default=1.0,
+        help="Exponent on target dynamic scale; <1.0 makes balancing updates more conservative.",
+    )
+    parser.add_argument(
+        "--grad_norm_balance_min_scale",
+        type=float,
+        default=0.1,
+        help="Min clamp for dynamic scale factor on lambda_g.",
+    )
+    parser.add_argument(
+        "--grad_norm_balance_max_scale",
+        type=float,
+        default=30.0,
+        help="Max clamp for dynamic scale factor on lambda_g.",
+    )
     parser.add_argument("--decoder_dim", type=int, default=384)
     parser.add_argument("--decoder_depth", type=int, default=4)
     parser.add_argument("--decoder_heads", type=int, default=6)
@@ -809,6 +996,14 @@ def main() -> None:
         device = torch.device(args.device)
     if is_distributed and is_main_process and device.type == "cpu":
         print("[warn] running distributed training on CPU backend, this is usually very slow.")
+    grad_strategy = str(args.grad_strategy).lower()
+    if grad_strategy == "conflict_aware":
+        grad_strategy = "pcgrad"
+    if is_distributed and grad_strategy != "naive":
+        raise RuntimeError(
+            "DDP + non-naive grad strategy is not supported in this script yet. "
+            "Please run single GPU for pcgrad/cagrad fair compare."
+        )
 
     train_loader, val_loader, data_meta = build_imagenet100_dataloaders(
         batch_size=int(args.batch_size),
@@ -882,6 +1077,13 @@ def main() -> None:
     metrics_path = run_dir / "train_metrics.jsonl"
     eval_metrics_path = run_dir / "eval_metrics.jsonl"
     encoder_groups = _group_encoder_params(base_model.encoder)
+    shared_params = [p for p in base_model.encoder.parameters() if p.requires_grad]
+    shared_ids = {id(p) for p in shared_params}
+    aux_params = [
+        p
+        for p in base_model.parameters()
+        if p.requires_grad and (id(p) not in shared_ids)
+    ]
     global_step = 0
     train_epoch = 0
     train_sampler = train_loader.sampler if isinstance(train_loader.sampler, DistributedSampler) else None
@@ -893,6 +1095,10 @@ def main() -> None:
         if is_main_process
         else None
     )
+    encoder_named_params = [(n, p) for n, p in base_model.encoder.named_parameters() if p.requires_grad]
+    dyn_scale = 1.0
+    dyn_gu_norm = float("nan")
+    dyn_gg_norm = float("nan")
 
     while global_step < int(args.max_steps):
         try:
@@ -917,7 +1123,35 @@ def main() -> None:
 
         loss_u = F.cross_entropy(logits, labels)
         loss_g = F.mse_loss(pred_patches, gt_patches)
-        total_loss = loss_u + loss_g
+        balance_every = max(0, int(args.grad_norm_balance_every))
+        if balance_every > 0 and (global_step % balance_every == 0):
+            # 动态估计共享 encoder 上两任务梯度幅度，用于平衡 lambda_g。
+            gu_dyn = _autograd_grads_by_name(
+                loss_u,
+                encoder_named_params,
+                retain_graph=True,
+            )
+            gg_dyn = _autograd_grads_by_name(
+                loss_g,
+                encoder_named_params,
+                retain_graph=True,
+            )
+            dyn_gu_norm = _global_grad_norm(gu_dyn)
+            dyn_gg_norm = _global_grad_norm(gg_dyn)
+            base_weight_ratio = float(args.lambda_u) / max(float(args.lambda_g), 1e-12)
+            target_scale = float(base_weight_ratio * dyn_gu_norm / max(dyn_gg_norm, 1e-12))
+            target_scale = float(target_scale ** float(args.grad_norm_balance_power))
+            target_scale = float(
+                min(
+                    max(target_scale, float(args.grad_norm_balance_min_scale)),
+                    float(args.grad_norm_balance_max_scale),
+                )
+            )
+            dyn_scale = float(args.grad_norm_balance_ema) * dyn_scale + (
+                1.0 - float(args.grad_norm_balance_ema)
+            ) * target_scale
+        eff_lambda_g = float(args.lambda_g) * float(dyn_scale)
+        total_loss = float(args.lambda_u) * loss_u + eff_lambda_g * loss_g
 
         should_probe = (
             global_step <= int(args.probe_until)
@@ -926,6 +1160,7 @@ def main() -> None:
 
         optimizer.zero_grad(set_to_none=True)
         probe_stats: Optional[Dict[str, float]] = None
+        train_grad_cos = 0.0
 
         if should_probe and is_main_process:
             # DDP 下探针梯度不能用多次 backward（会触发 mark ready twice）。
@@ -956,11 +1191,44 @@ def main() -> None:
                 encoder_groups=encoder_groups,
                 out_dir=run_dir,
             )
+            gu_norm = _global_grad_norm(dict_gu)
+            gg_norm = _global_grad_norm(dict_gg)
+            probe_stats["global_gu_norm"] = float(gu_norm)
+            probe_stats["global_gg_norm"] = float(gg_norm)
+            probe_stats["global_gu_over_gg"] = float(gu_norm / max(gg_norm, 1e-12))
 
-            # 正常联合更新仍保持一次 backward。
-            total_loss.backward()
+            # 探针使用独立前向，不影响训练图；训练仍在当前图上做一步更新。
+
+        if grad_strategy == "naive":
+            train_grad_cos = apply_naive(
+                loss_txt=loss_u,
+                loss_rec=loss_g,
+                shared_params=shared_params,
+                aux_params=aux_params,
+                lambda_txt=float(args.lambda_u),
+                lambda_rec=float(eff_lambda_g),
+            )
+        elif grad_strategy == "pcgrad":
+            train_grad_cos = apply_conflict_aware(
+                loss_txt=loss_u,
+                loss_rec=loss_g,
+                lora_params=shared_params,
+                aux_params=aux_params,
+                lambda_txt=float(args.lambda_u),
+                lambda_rec=float(eff_lambda_g),
+            )
+        elif grad_strategy == "cagrad":
+            train_grad_cos = apply_cagrad(
+                loss_txt=loss_u,
+                loss_rec=loss_g,
+                shared_params=shared_params,
+                aux_params=aux_params,
+                lambda_txt=float(args.lambda_u),
+                lambda_rec=float(eff_lambda_g),
+                beta=float(args.cagrad_beta),
+            )
         else:
-            total_loss.backward()
+            raise ValueError(f"Unsupported grad_strategy={grad_strategy}")
 
         optimizer.step()
 
@@ -971,24 +1239,53 @@ def main() -> None:
         loss_u_log = _reduce_mean_scalar(float(loss_u.detach().item()), device, is_distributed, world_size)
         loss_g_log = _reduce_mean_scalar(float(loss_g.detach().item()), device, is_distributed, world_size)
         loss_total_log = _reduce_mean_scalar(float(total_loss.detach().item()), device, is_distributed, world_size)
+        loss_u_weighted_log = float(args.lambda_u) * loss_u_log
+        loss_g_weighted_log = float(eff_lambda_g) * loss_g_log
         acc_log = _reduce_mean_scalar(float(acc.item()), device, is_distributed, world_size)
         rmse_log = _reduce_mean_scalar(float(rmse.item()), device, is_distributed, world_size)
+        raw_ratio = loss_u_log / max(loss_g_log, 1e-12)
+        weighted_ratio = loss_u_weighted_log / max(loss_g_weighted_log, 1e-12)
 
         row = {
             "step": int(global_step),
             "loss_u": float(loss_u_log),
             "loss_g": float(loss_g_log),
+            "loss_u_weighted": float(loss_u_weighted_log),
+            "loss_g_weighted": float(loss_g_weighted_log),
             "loss_total": float(loss_total_log),
+            "loss_ratio_u_over_g": float(raw_ratio),
+            "loss_ratio_weighted_u_over_g": float(weighted_ratio),
+            "effective_lambda_g": float(eff_lambda_g),
+            "grad_strategy": grad_strategy,
+            "train_grad_cosine": float(train_grad_cos),
             "acc": float(acc_log),
             "rmse": float(rmse_log),
         }
+        if balance_every > 0:
+            row["dyn_scale"] = float(dyn_scale)
+            row["dyn_gu_norm"] = float(dyn_gu_norm)
+            row["dyn_gg_norm"] = float(dyn_gg_norm)
+            row["dyn_gu_over_gg"] = float(dyn_gu_norm / max(dyn_gg_norm, 1e-12))
+            row["dyn_weighted_gu_over_gg"] = float(
+                (float(args.lambda_u) * dyn_gu_norm) / max(float(eff_lambda_g) * dyn_gg_norm, 1e-12)
+            )
         if is_main_process and probe_stats is not None:
             row["probe_mean_cosine"] = float(probe_stats["mean_cosine"])
             row["probe_mean_neg_ratio"] = float(probe_stats["mean_neg_ratio"])
+            row["probe_global_gu_norm"] = float(probe_stats["global_gu_norm"])
+            row["probe_global_gg_norm"] = float(probe_stats["global_gg_norm"])
+            row["probe_global_gu_over_gg"] = float(probe_stats["global_gu_over_gg"])
+            row["probe_weighted_gu_over_gg"] = float(
+                (float(args.lambda_u) * probe_stats["global_gu_norm"])
+                / max(float(eff_lambda_g) * probe_stats["global_gg_norm"], 1e-12)
+            )
             row["probe_csv"] = str(probe_stats["csv_path"])
             print(
                 f"[probe] step={global_step} mean_cos={probe_stats['mean_cosine']:.4f} "
-                f"mean_neg_ratio={probe_stats['mean_neg_ratio']:.4f} csv={probe_stats['csv_path']}"
+                f"mean_neg_ratio={probe_stats['mean_neg_ratio']:.4f} "
+                f"gu/gg={probe_stats['global_gu_over_gg']:.2f} "
+                f"weighted_gu/weighted_gg={row['probe_weighted_gu_over_gg']:.2f} "
+                f"csv={probe_stats['csv_path']}"
             )
 
         if is_main_process:
@@ -1001,6 +1298,9 @@ def main() -> None:
                     pbar.set_postfix(
                         lu=f"{row['loss_u']:.4f}",
                         lg=f"{row['loss_g']:.4f}",
+                        luw=f"{row['loss_u_weighted']:.4f}",
+                        lgw=f"{row['loss_g_weighted']:.4f}",
+                        lg_eff=f"{row['effective_lambda_g']:.1f}",
                         acc=f"{row['acc']:.3f}",
                         rmse=f"{row['rmse']:.4f}",
                     )
