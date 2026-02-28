@@ -116,8 +116,9 @@ for method in $METHODS; do
     "${COMMON_ARGS[@]}"
     --method "${method}"
     --run_name "${run_name}"
-    "${EXTRA_ARGS[@]}"
   )
+  # 兼容旧版 bash + set -u：空数组展开可能触发 unbound variable。
+  LAUNCH_CMD+=( ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} )
   set -x
   "${LAUNCH_CMD[@]}" 2>&1 | tee "$log_file"
   set +x
