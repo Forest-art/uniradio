@@ -19,6 +19,7 @@ Optional env vars:
   LR=5e-4
   WARMUP_STEPS=1000
   NUM_WORKERS=8
+  EVAL_RFID_EVERY=0           # 0 means disable periodic rFID, e.g. set 1000 for every 1k steps
   SEED=42
   OUTPUT_ROOT=results/in100_method6_runs
   RUN_GROUP=in100_method6_YYYYmmdd_HHMMSS
@@ -46,6 +47,7 @@ MAX_STEPS=${MAX_STEPS:-10000}
 LR=${LR:-5e-4}
 WARMUP_STEPS=${WARMUP_STEPS:-1000}
 NUM_WORKERS=${NUM_WORKERS:-8}
+EVAL_RFID_EVERY=${EVAL_RFID_EVERY:-0}
 SEED=${SEED:-42}
 OUTPUT_ROOT=${OUTPUT_ROOT:-results/in100_method6_runs}
 RUN_GROUP=${RUN_GROUP:-in100_method6_$(date +%Y%m%d_%H%M%S)}
@@ -107,7 +109,7 @@ COMMON_ARGS=(
   --probe_until "$MAX_STEPS"
   --eval_every 1000
   --eval_max_batches 50
-  --eval_rfid_every 0
+  --eval_rfid_every "$EVAL_RFID_EVERY"
   --eval_rfid_num_samples 2048
   --eval_rfid_batch_size 64
   --seed "$SEED"
@@ -136,6 +138,7 @@ else
   echo "[start] HF_DATASET_ID=${HF_DATASET_ID}"
 fi
 echo "[start] NPROC_PER_NODE=${NPROC_PER_NODE}, BATCH_SIZE_PER_GPU=${BATCH_SIZE_PER_GPU}, GLOBAL_BATCH=$((NPROC_PER_NODE * BATCH_SIZE_PER_GPU))"
+echo "[start] EVAL_RFID_EVERY=${EVAL_RFID_EVERY}"
 echo "[start] OUTPUT_ROOT=${RUN_ROOT}"
 
 echo "method,run_name,log_file" > "${RUN_ROOT}/run_manifest.csv"
