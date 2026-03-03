@@ -13,7 +13,14 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
-from .grad_conflict import apply_cagrad, apply_conflict_aware, apply_gma_laga, apply_la_cagrad, apply_naive
+from .grad_conflict import (
+    apply_cagrad,
+    apply_conflict_aware,
+    apply_egd,
+    apply_gma_laga,
+    apply_la_cagrad,
+    apply_naive,
+)
 try:
     from .losses import FeatureVarianceLoss
 except Exception:  # noqa: BLE001
@@ -596,6 +603,7 @@ def main() -> None:
             "cagrad",
             "la_cagrad",
             "gma_laga",
+            "egd",
             "lacar",
             "laga",
             "ma_laga",
@@ -880,7 +888,10 @@ def main() -> None:
         if (
             (not aligned_once)
             and args.auto_align_lambda_g
-            and (args.method in {"joint", "pcgrad", "cagrad", "la_cagrad", "gma_laga", "lacar", "laga", "ma_laga", "laga_gbvc"})
+            and (
+                args.method
+                in {"joint", "pcgrad", "cagrad", "la_cagrad", "gma_laga", "egd", "lacar", "laga", "ma_laga", "laga_gbvc"}
+            )
         ):
             lu_mean = _reduce_mean_scalar(float(loss_u.detach().item()), device, is_distributed, world_size)
             lg_mean = _reduce_mean_scalar(float(loss_g.detach().item()), device, is_distributed, world_size)
@@ -996,6 +1007,18 @@ def main() -> None:
                 lambda_txt=float(args.lambda_u),
                 lambda_rec=float(runtime_lambda_g),
                 max_scale=float(args.gma_laga_max_scale),
+                eps=1e-8,
+            )
+
+        elif args.method == "egd":
+            train_grad_cos = apply_egd(
+                loss_txt=loss_u,
+                loss_rec=loss_g,
+                shared_params=shared_params,
+                aux_params=aux_params,
+                group_to_indices=encoder_group_indices,
+                lambda_txt=float(args.lambda_u),
+                lambda_rec=float(runtime_lambda_g),
                 eps=1e-8,
             )
 

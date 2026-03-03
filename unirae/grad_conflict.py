@@ -332,16 +332,19 @@ def apply_ma_laga(
     grads_g: Sequence[torch.Tensor],
     layers: Optional[Dict[str, Sequence[int]]],
     align_gamma: float = 0.5,
+    align_max_scale: float = 0.0,
     norm_restore: bool = True,
+    mode: str = "full",
     eps: float = 1e-8,
 ) -> List[torch.Tensor]:
     """Magnitude-Aligned LAGA (MA-LAGA).
 
-    For each layer group:
-      1) compute cos between original g_u and g_g;
-      2) align generation magnitude by (||g_u||/||g_g||)^align_gamma;
-      3) if conflict (cos < 0), project aligned g_g to null-space of g_u;
-      4) optionally restore projected norm back to aligned norm.
+    Supported modes:
+      - full: MA + LAGA (align then conflict projection).
+      - capped_full: cap alignment scale then apply LAGA projection on conflicts.
+      - direction_only: pure LAGA without magnitude alignment.
+      - magnitude_only: pure MA without projection (always sum aligned gradients).
+      - nr_laga: project generation gradient on conflicts, then restore to its own norm.
     """
     if len(grads_u) != len(grads_g):
         raise ValueError(
@@ -352,7 +355,18 @@ def apply_ma_laga(
 
     eps = float(max(1e-12, eps))
     align_gamma = float(max(0.0, align_gamma))
+    align_max_scale = float(align_max_scale)
     norm_restore = bool(norm_restore)
+    mode = str(mode).lower()
+    if mode not in {"full", "capped_full", "direction_only", "magnitude_only", "nr_laga"}:
+        raise ValueError(
+            f"Unsupported MA-LAGA mode={mode}. "
+            "Use one of: full|capped_full|direction_only|magnitude_only|nr_laga."
+        )
+    if mode == "capped_full" and align_max_scale <= 0.0:
+        raise ValueError(
+            f"MA-LAGA capped_full requires align_max_scale>0, got {align_max_scale}."
+        )
     merged = [torch.zeros_like(g) for g in grads_u]
 
     if not layers:
@@ -377,22 +391,50 @@ def apply_ma_laga(
         dot_ug = torch.dot(gu_flat, gg_flat)
         cos = dot_ug / (m_u * m_g + eps)
 
-        # Dynamic magnitude alignment before geometric routing.
-        scale_factor = torch.pow((m_u / (m_g + eps)).clamp_min(eps), align_gamma).detach()
-        gg_aligned_group = [scale_factor * gg for gg in gg_group]
-
-        if float(cos.item()) >= 0.0:
-            merged_group = [gu + gg_aligned for gu, gg_aligned in zip(gu_group, gg_aligned_group)]
-        else:
-            gg_aligned_flat = _flatten(gg_aligned_group)
-            proj_coeff = torch.dot(gg_aligned_flat, gu_flat) / (torch.dot(gu_flat, gu_flat) + eps)
-            gg_perp_group = [gg_aligned - proj_coeff * gu for gu, gg_aligned in zip(gu_group, gg_aligned_group)]
-            if norm_restore:
-                norm_aligned = torch.linalg.norm(gg_aligned_flat)
+        if mode == "direction_only":
+            # Pure LAGA: no magnitude alignment.
+            if float(cos.item()) >= 0.0:
+                merged_group = [gu + gg for gu, gg in zip(gu_group, gg_group)]
+            else:
+                proj_coeff = dot_ug / (torch.dot(gu_flat, gu_flat) + eps)
+                gg_perp_group = [gg - proj_coeff * gu for gu, gg in zip(gu_group, gg_group)]
+                merged_group = [gu + gg_perp for gu, gg_perp in zip(gu_group, gg_perp_group)]
+        elif mode == "nr_laga":
+            # Norm-Restored LAGA: no alignment to understanding norm.
+            if float(cos.item()) >= 0.0:
+                merged_group = [gu + gg for gu, gg in zip(gu_group, gg_group)]
+            else:
+                proj_coeff = dot_ug / (torch.dot(gu_flat, gu_flat) + eps)
+                gg_perp_group = [gg - proj_coeff * gu for gu, gg in zip(gu_group, gg_group)]
                 norm_perp = torch.linalg.norm(_flatten(gg_perp_group))
-                restore_scale = norm_aligned / (norm_perp + eps)
+                restore_scale = m_g / (norm_perp + eps)
                 gg_perp_group = [restore_scale * gg_perp for gg_perp in gg_perp_group]
-            merged_group = [gu + gg_perp for gu, gg_perp in zip(gu_group, gg_perp_group)]
+                merged_group = [gu + gg_perp for gu, gg_perp in zip(gu_group, gg_perp_group)]
+        else:
+            # Magnitude alignment stage.
+            if mode == "capped_full":
+                scale_factor = torch.clamp(m_u / (m_g + eps), max=align_max_scale).detach()
+            else:
+                scale_factor = torch.pow((m_u / (m_g + eps)).clamp_min(eps), align_gamma).detach()
+            gg_aligned_group = [scale_factor * gg for gg in gg_group]
+
+            if mode == "magnitude_only":
+                # Pure MA: never project, always add aligned generation gradient.
+                merged_group = [gu + gg_aligned for gu, gg_aligned in zip(gu_group, gg_aligned_group)]
+            else:
+                # Full MA-LAGA.
+                if float(cos.item()) >= 0.0:
+                    merged_group = [gu + gg_aligned for gu, gg_aligned in zip(gu_group, gg_aligned_group)]
+                else:
+                    gg_aligned_flat = _flatten(gg_aligned_group)
+                    proj_coeff = torch.dot(gg_aligned_flat, gu_flat) / (torch.dot(gu_flat, gu_flat) + eps)
+                    gg_perp_group = [gg_aligned - proj_coeff * gu for gu, gg_aligned in zip(gu_group, gg_aligned_group)]
+                    if norm_restore:
+                        norm_aligned = torch.linalg.norm(gg_aligned_flat)
+                        norm_perp = torch.linalg.norm(_flatten(gg_perp_group))
+                        restore_scale = norm_aligned / (norm_perp + eps)
+                        gg_perp_group = [restore_scale * gg_perp for gg_perp in gg_perp_group]
+                    merged_group = [gu + gg_perp for gu, gg_perp in zip(gu_group, gg_perp_group)]
 
         for idx, g in zip(idxs, merged_group):
             merged[idx] = g
@@ -682,6 +724,253 @@ def apply_cagrad(
     )
 
 
+def apply_la_cagrad(
+    loss_txt: torch.Tensor,
+    loss_rec: torch.Tensor,
+    shared_params: Sequence[torch.nn.Parameter],
+    aux_params: Sequence[torch.nn.Parameter],
+    group_to_indices: Optional[Dict[str, Sequence[int]]],
+    lambda_txt: float,
+    lambda_rec: float,
+    beta: float = 0.5,
+    grad_norm_mode: str = "none",
+    grad_norm_indices: Optional[Sequence[int]] = None,
+    grad_norm_conflict_only: bool = False,
+    extra_loss: Optional[torch.Tensor] = None,
+) -> float:
+    """Layer-wise CAGrad (LA-CAGrad).
+
+    Apply CAGrad merge independently on each parameter group, then write merged
+    gradients back to shared params. Auxiliary params use weighted total loss
+    gradients, matching global CAGrad fairness protocol.
+    """
+    beta = max(0.0, min(1.0, float(beta)))
+
+    def _merge(wg_txt: List[torch.Tensor], wg_rec: List[torch.Tensor], _: float) -> List[torch.Tensor]:
+        if not group_to_indices:
+            return _cagrad_like_merge(wg_txt, wg_rec, beta=beta)
+
+        merged = [torch.zeros_like(g) for g in wg_txt]
+        covered: Set[int] = set()
+
+        for _, raw_indices in group_to_indices.items():
+            idxs = [int(i) for i in raw_indices if 0 <= int(i) < len(wg_txt)]
+            if len(idxs) == 0:
+                continue
+            covered.update(idxs)
+            g_txt_k = [wg_txt[i] for i in idxs]
+            g_rec_k = [wg_rec[i] for i in idxs]
+            merged_k = _cagrad_like_merge(g_txt_k, g_rec_k, beta=beta)
+            for idx, g in zip(idxs, merged_k):
+                merged[idx] = g
+
+        # Safety fallback for params not covered by any group.
+        for idx in range(len(wg_txt)):
+            if idx not in covered:
+                merged[idx] = _cagrad_like_merge([wg_txt[idx]], [wg_rec[idx]], beta=beta)[0]
+        return merged
+
+    return _apply_multi_objective(
+        loss_txt=loss_txt,
+        loss_rec=loss_rec,
+        shared_params=shared_params,
+        aux_params=aux_params,
+        lambda_txt=lambda_txt,
+        lambda_rec=lambda_rec,
+        merge_fn=_merge,
+        grad_norm_mode=grad_norm_mode,
+        grad_norm_indices=grad_norm_indices,
+        grad_norm_conflict_only=grad_norm_conflict_only,
+        extra_loss=extra_loss,
+    )
+
+
+def apply_gma_laga(
+    loss_txt: torch.Tensor,
+    loss_rec: torch.Tensor,
+    shared_params: Sequence[torch.nn.Parameter],
+    aux_params: Sequence[torch.nn.Parameter],
+    group_to_indices: Optional[Dict[str, Sequence[int]]],
+    lambda_txt: float,
+    lambda_rec: float,
+    max_scale: float = 100.0,
+    eps: float = 1e-8,
+    grad_norm_mode: str = "none",
+    grad_norm_indices: Optional[Sequence[int]] = None,
+    grad_norm_conflict_only: bool = False,
+    extra_loss: Optional[torch.Tensor] = None,
+) -> float:
+    """Global Magnitude-Aligned LAGA (GMA-LAGA).
+
+    1) Compute one global scale factor S from all encoder grads.
+    2) Apply layer-wise asymmetric projection routing with scaled generation grads.
+    """
+    eps = float(max(1e-12, eps))
+    max_scale = float(max_scale)
+
+    def _merge(wg_txt: List[torch.Tensor], wg_rec: List[torch.Tensor], _: float) -> List[torch.Tensor]:
+        if len(wg_txt) == 0:
+            return []
+
+        # Global magnitude alignment scale.
+        norm_u = _group_l2_norm(wg_txt, eps=eps)
+        norm_g = _group_l2_norm(wg_rec, eps=eps)
+        scale = (norm_u / (norm_g + eps)).detach()
+        if max_scale > 0.0:
+            scale = torch.clamp(scale, max=max_scale)
+
+        if not group_to_indices:
+            v_u = _flatten(wg_txt)
+            v_g = _flatten(wg_rec)
+            v_g_scaled = scale * v_g
+            cos = float((torch.dot(v_u, v_g) / (torch.linalg.norm(v_u) * torch.linalg.norm(v_g) + eps)).item())
+            if cos >= 0.0:
+                merged_flat = v_u + v_g_scaled
+            else:
+                proj_coeff = torch.dot(v_g_scaled, v_u) / torch.dot(v_u, v_u).clamp_min(eps)
+                v_g_perp = v_g_scaled - proj_coeff * v_u
+                merged_flat = v_u + v_g_perp
+            return _unflatten_like(merged_flat, wg_txt)
+
+        merged = [torch.zeros_like(g) for g in wg_txt]
+        covered: Set[int] = set()
+        for _, raw_indices in group_to_indices.items():
+            idxs = [int(i) for i in raw_indices if 0 <= int(i) < len(wg_txt)]
+            if len(idxs) == 0:
+                continue
+            covered.update(idxs)
+
+            g_u_k = [wg_txt[i] for i in idxs]
+            g_g_k = [wg_rec[i] for i in idxs]
+            v_u_k = _flatten(g_u_k)
+            v_g_k = _flatten(g_g_k)
+            v_g_k_scaled = scale * v_g_k
+
+            # Cosine with original generation gradient (scale-invariant by design).
+            cos = float(
+                (
+                    torch.dot(v_u_k, v_g_k)
+                    / (torch.linalg.norm(v_u_k) * torch.linalg.norm(v_g_k) + eps)
+                ).item()
+            )
+            if cos >= 0.0:
+                v_m_k = v_u_k + v_g_k_scaled
+            else:
+                proj_coeff = torch.dot(v_g_k_scaled, v_u_k) / torch.dot(v_u_k, v_u_k).clamp_min(eps)
+                v_g_perp = v_g_k_scaled - proj_coeff * v_u_k
+                v_m_k = v_u_k + v_g_perp
+
+            off = 0
+            for i in idxs:
+                n = int(wg_txt[i].numel())
+                merged[i] = v_m_k[off : off + n].view_as(wg_txt[i])
+                off += n
+
+        for idx in range(len(wg_txt)):
+            if idx not in covered:
+                merged[idx] = wg_txt[idx] + scale * wg_rec[idx]
+        return merged
+
+    return _apply_multi_objective(
+        loss_txt=loss_txt,
+        loss_rec=loss_rec,
+        shared_params=shared_params,
+        aux_params=aux_params,
+        lambda_txt=lambda_txt,
+        lambda_rec=lambda_rec,
+        merge_fn=_merge,
+        grad_norm_mode=grad_norm_mode,
+        grad_norm_indices=grad_norm_indices,
+        grad_norm_conflict_only=grad_norm_conflict_only,
+        extra_loss=extra_loss,
+    )
+
+
+def apply_egd(
+    loss_txt: torch.Tensor,
+    loss_rec: torch.Tensor,
+    shared_params: Sequence[torch.nn.Parameter],
+    aux_params: Sequence[torch.nn.Parameter],
+    group_to_indices: Optional[Dict[str, Sequence[int]]],
+    lambda_txt: float,
+    lambda_rec: float,
+    eps: float = 1e-8,
+    grad_norm_mode: str = "none",
+    grad_norm_indices: Optional[Sequence[int]] = None,
+    grad_norm_conflict_only: bool = False,
+    extra_loss: Optional[torch.Tensor] = None,
+) -> float:
+    """Element-wise Gradient Disentanglement (EGD).
+
+    For each group k:
+      1) normalize g_u,k / ||g_u,k|| and g_g,k / ||g_g,k||
+      2) route per element:
+         - same sign: g_u + g_g
+         - opposite sign: pick winner by larger normalized magnitude
+    """
+    eps = float(max(1e-12, eps))
+
+    def _merge_group(g_u_k: List[torch.Tensor], g_g_k: List[torch.Tensor]) -> List[torch.Tensor]:
+        v_u = _flatten(g_u_k)
+        v_g = _flatten(g_g_k)
+
+        n_u = torch.linalg.norm(v_u)
+        n_g = torch.linalg.norm(v_g)
+        v_u_n = v_u / (n_u + eps)
+        v_g_n = v_g / (n_g + eps)
+
+        mask_syn = (v_u * v_g) >= 0
+        mask_conf = ~mask_syn
+        mask_u_wins = v_u_n.abs() >= v_g_n.abs()
+
+        v_m = torch.zeros_like(v_u)
+        v_m[mask_syn] = v_u[mask_syn] + v_g[mask_syn]
+
+        mask_conf_u = mask_conf & mask_u_wins
+        mask_conf_g = mask_conf & (~mask_u_wins)
+        v_m[mask_conf_u] = v_u[mask_conf_u]
+        v_m[mask_conf_g] = v_g[mask_conf_g]
+        return _unflatten_like(v_m, g_u_k)
+
+    def _merge(wg_txt: List[torch.Tensor], wg_rec: List[torch.Tensor], _: float) -> List[torch.Tensor]:
+        if len(wg_txt) == 0:
+            return []
+        if not group_to_indices:
+            return _merge_group(wg_txt, wg_rec)
+
+        merged = [torch.zeros_like(g) for g in wg_txt]
+        covered: Set[int] = set()
+        for _, raw_indices in group_to_indices.items():
+            idxs = [int(i) for i in raw_indices if 0 <= int(i) < len(wg_txt)]
+            if len(idxs) == 0:
+                continue
+            covered.update(idxs)
+            g_u_k = [wg_txt[i] for i in idxs]
+            g_g_k = [wg_rec[i] for i in idxs]
+            g_m_k = _merge_group(g_u_k, g_g_k)
+            for idx, g in zip(idxs, g_m_k):
+                merged[idx] = g
+
+        for idx in range(len(wg_txt)):
+            if idx not in covered:
+                merged[idx] = wg_txt[idx] + wg_rec[idx]
+        return merged
+
+    return _apply_multi_objective(
+        loss_txt=loss_txt,
+        loss_rec=loss_rec,
+        shared_params=shared_params,
+        aux_params=aux_params,
+        lambda_txt=lambda_txt,
+        lambda_rec=lambda_rec,
+        merge_fn=_merge,
+        grad_norm_mode=grad_norm_mode,
+        grad_norm_indices=grad_norm_indices,
+        grad_norm_conflict_only=grad_norm_conflict_only,
+        extra_loss=extra_loss,
+    )
+
+
 def apply_saop(
     loss_txt: torch.Tensor,
     loss_rec: torch.Tensor,
@@ -816,6 +1105,7 @@ def apply_ma_laga_objective(
     group_to_indices: Optional[Dict[str, Sequence[int]]] = None,
     align_gamma: float = 0.5,
     norm_restore: bool = True,
+    mode: str = "full",
     eps: float = 1e-8,
     grad_norm_mode: str = "none",
     grad_norm_indices: Optional[Sequence[int]] = None,
@@ -831,6 +1121,7 @@ def apply_ma_laga_objective(
             layers=group_to_indices,
             align_gamma=align_gamma,
             norm_restore=norm_restore,
+            mode=mode,
             eps=eps,
         )
 
