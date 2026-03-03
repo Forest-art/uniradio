@@ -1,5 +1,6 @@
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -12,7 +13,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
-from .grad_conflict import apply_cagrad, apply_conflict_aware, apply_naive
+from .grad_conflict import apply_cagrad, apply_conflict_aware, apply_gma_laga, apply_la_cagrad, apply_naive
 try:
     from .losses import FeatureVarianceLoss
 except Exception:  # noqa: BLE001
@@ -141,6 +142,45 @@ def _build_param_groups(base_model: ViTBridgeModel):
     return enc_named, cls_named, dec_named, shared_params, aux_params
 
 
+def _build_encoder_group_indices(enc_named: List[Tuple[str, nn.Parameter]]) -> Dict[str, List[int]]:
+    """Build layer-wise groups for encoder parameters."""
+    groups: Dict[str, List[int]] = {}
+    for idx, (name, _) in enumerate(enc_named):
+        if name.startswith("patch_embed"):
+            gname = "patch_embed"
+        elif (
+            name.startswith("cls_token")
+            or name.startswith("pos_embed")
+            or name.startswith("register_tokens")
+        ):
+            gname = "embeddings"
+        elif name.startswith("blocks."):
+            parts = name.split(".")
+            block_id = parts[1] if len(parts) > 1 else "0"
+            gname = f"blocks.{block_id}"
+        elif name.startswith("norm"):
+            gname = "norm"
+        else:
+            gname = "other"
+        groups.setdefault(gname, []).append(idx)
+    return groups
+
+
+def _build_recon_objective(
+    pred_patches: torch.Tensor,
+    gt_patches: torch.Tensor,
+    loss_type: str,
+    rmse_eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return (reconstruction objective used for backward, raw mse for metrics)."""
+    mse = F.mse_loss(pred_patches, gt_patches)
+    if loss_type == "mse":
+        return mse, mse
+    if loss_type == "rmse":
+        return torch.sqrt(mse + float(rmse_eps)), mse
+    raise ValueError(f"Unsupported recon loss_type={loss_type}")
+
+
 def _collect_probe_stats(
     *,
     base_model: ViTBridgeModel,
@@ -151,6 +191,8 @@ def _collect_probe_stats(
     global_step: int,
     encoder_groups: List[Tuple[str, int, List[Tuple[str, nn.Parameter]]]],
     enc_named: List[Tuple[str, nn.Parameter]],
+    recon_loss_type: str,
+    recon_rmse_eps: float,
 ) -> Dict[str, float]:
     probe_outputs = base_model(images)
     probe_logits = probe_outputs["logits"]
@@ -158,7 +200,12 @@ def _collect_probe_stats(
     probe_gt_patches = base_model.patchify(images_01)
 
     probe_loss_u = F.cross_entropy(probe_logits, labels)
-    probe_loss_g = F.mse_loss(probe_pred_patches, probe_gt_patches)
+    probe_loss_g, _ = _build_recon_objective(
+        probe_pred_patches,
+        probe_gt_patches,
+        loss_type=str(recon_loss_type),
+        rmse_eps=float(recon_rmse_eps),
+    )
 
     dict_gu = _autograd_grads_by_name(probe_loss_u, enc_named, retain_graph=True)
     dict_gg = _autograd_grads_by_name(probe_loss_g, enc_named, retain_graph=False)
@@ -244,6 +291,296 @@ def _run_lacar_step(
     return float(_safe_cosine(_flatten(gu_list), _flatten(gg_list)))
 
 
+def _run_laga_step(
+    *,
+    loss_u: torch.Tensor,
+    loss_g: torch.Tensor,
+    enc_named: List[Tuple[str, nn.Parameter]],
+    cls_params: List[nn.Parameter],
+    dec_params: List[nn.Parameter],
+    lambda_u: float,
+    lambda_g: float,
+    eps: float = 1e-12,
+) -> float:
+    """Layer-wise Asymmetric Gradient Arbitration (LAGA).
+
+    For each encoder block k (0..11):
+      c_k = cos(g_u,k, g_g,k)
+      if c_k >= 0:
+          g*_k = g_u,k + g_g,k
+      else:
+          g_g,k <- g_g,k - proj_{g_u,k}(g_g,k)
+          g*_k = g_u,k + g_g,k_proj
+
+    Implementation note:
+      - Arbitration is block-wise (concatenate all params inside a block),
+        then unflatten back to each tensor.
+      - Non-block encoder params (e.g., embeddings/patch_embed/norm) use
+        weighted direct sum for stability.
+    """
+    enc_params = [p for _, p in enc_named]
+
+    gu_list = _materialize_grads(loss_u, enc_params, retain_graph=True)
+    gg_list = _materialize_grads(loss_g, enc_params, retain_graph=True)
+    cls_grads = _materialize_grads(loss_u, cls_params, retain_graph=True)
+    dec_grads = _materialize_grads(loss_g, dec_params, retain_graph=False)
+
+    # Apply loss weights before arbitration so fairness protocol is preserved.
+    wg_u = [float(lambda_u) * g for g in gu_list]
+    wg_g = [float(lambda_g) * g for g in gg_list]
+
+    merged_enc = [u + g for u, g in zip(wg_u, wg_g)]
+
+    block_to_indices: Dict[int, List[int]] = {k: [] for k in range(12)}
+    for idx, (name, _) in enumerate(enc_named):
+        m = re.match(r"^blocks\.(\d+)\.", name)
+        if m is None:
+            continue
+        k = int(m.group(1))
+        if 0 <= k <= 11:
+            block_to_indices[k].append(idx)
+
+    eps = float(max(1e-12, eps))
+
+    for k in range(12):
+        idxs = block_to_indices[k]
+        if len(idxs) == 0:
+            continue
+
+        u_block = [wg_u[i] for i in idxs]
+        g_block = [wg_g[i] for i in idxs]
+        v_u = _flatten(u_block)
+        v_g = _flatten(g_block)
+
+        dot = torch.dot(v_u, v_g)
+        nu = torch.linalg.norm(v_u)
+        ng = torch.linalg.norm(v_g)
+        cos = dot / (nu * ng + eps)
+
+        if float(cos.item()) >= 0.0:
+            v_m = v_u + v_g
+        else:
+            proj_coeff = dot / torch.dot(v_u, v_u).clamp_min(eps)
+            v_g_proj = v_g - proj_coeff * v_u
+            v_m = v_u + v_g_proj
+
+        off = 0
+        for i in idxs:
+            ref = wg_u[i]
+            n = int(ref.numel())
+            merged_enc[i] = v_m[off : off + n].view_as(ref)
+            off += n
+
+    _set_grads(enc_params, merged_enc)
+    _set_grads(cls_params, [float(lambda_u) * g for g in cls_grads])
+    _set_grads(dec_params, [float(lambda_g) * g for g in dec_grads])
+
+    return float(_safe_cosine(_flatten(gu_list), _flatten(gg_list)))
+
+
+def _run_ma_laga_step(
+    *,
+    loss_u: torch.Tensor,
+    loss_g: torch.Tensor,
+    enc_named: List[Tuple[str, nn.Parameter]],
+    cls_params: List[nn.Parameter],
+    dec_params: List[nn.Parameter],
+    lambda_u: float,
+    lambda_g: float,
+    align_gamma: float = 1.0,
+    align_max_scale: float = 0.0,
+    norm_restore: bool = False,
+    mode: str = "full",
+    eps: float = 1e-8,
+) -> float:
+    """MA-LAGA family on ViT blocks.
+
+    mode:
+      - full: MA-LAGA (align magnitude then conflict projection)
+      - capped_full: cap alignment scale then apply LAGA projection on conflicts
+      - direction_only: pure LAGA (projection only)
+      - magnitude_only: pure MA (alignment only, no projection)
+      - nr_laga: projection + restore generation's own norm on conflicts
+    """
+    enc_params = [p for _, p in enc_named]
+
+    gu_list = _materialize_grads(loss_u, enc_params, retain_graph=True)
+    gg_list = _materialize_grads(loss_g, enc_params, retain_graph=True)
+    cls_grads = _materialize_grads(loss_u, cls_params, retain_graph=True)
+    dec_grads = _materialize_grads(loss_g, dec_params, retain_graph=False)
+
+    # Keep fairness protocol: apply task weights before block arbitration.
+    wg_u = [float(lambda_u) * g for g in gu_list]
+    wg_g = [float(lambda_g) * g for g in gg_list]
+
+    merged_enc = [u + g for u, g in zip(wg_u, wg_g)]
+
+    block_to_indices: Dict[int, List[int]] = {k: [] for k in range(12)}
+    for idx, (name, _) in enumerate(enc_named):
+        m = re.match(r"^blocks\.(\d+)\.", name)
+        if m is None:
+            continue
+        k = int(m.group(1))
+        if 0 <= k <= 11:
+            block_to_indices[k].append(idx)
+
+    eps = float(max(1e-8, eps))
+    align_gamma = float(max(0.0, align_gamma))
+    align_max_scale = float(align_max_scale)
+    mode = str(mode).lower()
+    if mode not in {"full", "capped_full", "direction_only", "magnitude_only", "nr_laga"}:
+        raise ValueError(
+            f"Unsupported ma_laga_mode={mode}. "
+            "Use one of: full|capped_full|direction_only|magnitude_only|nr_laga."
+        )
+    if mode == "capped_full" and align_max_scale <= 0.0:
+        raise ValueError(
+            f"ma_laga_mode=capped_full requires ma_laga_max_scale>0, got {align_max_scale}"
+        )
+
+    for k in range(12):
+        idxs = block_to_indices[k]
+        if len(idxs) == 0:
+            continue
+
+        u_block = [wg_u[i] for i in idxs]
+        g_block = [wg_g[i] for i in idxs]
+        v_u = _flatten(u_block)
+        v_g = _flatten(g_block)
+
+        dot = torch.dot(v_u, v_g)
+        nu = torch.linalg.norm(v_u)
+        ng = torch.linalg.norm(v_g)
+        cos = dot / (nu * ng + eps)
+
+        if mode == "direction_only":
+            if float(cos.item()) >= 0.0:
+                v_m = v_u + v_g
+            else:
+                proj_coeff = dot / torch.dot(v_u, v_u).clamp_min(eps)
+                v_g_perp = v_g - proj_coeff * v_u
+                v_m = v_u + v_g_perp
+        elif mode == "nr_laga":
+            if float(cos.item()) >= 0.0:
+                v_m = v_u + v_g
+            else:
+                proj_coeff = dot / torch.dot(v_u, v_u).clamp_min(eps)
+                v_g_perp = v_g - proj_coeff * v_u
+                ng_perp = torch.linalg.norm(v_g_perp)
+                v_g_perp_restored = v_g_perp * (ng / (ng_perp + eps))
+                v_m = v_u + v_g_perp_restored
+        else:
+            if mode == "capped_full":
+                scale_factor = torch.clamp(nu / (ng + eps), max=align_max_scale).detach()
+            else:
+                scale_factor = torch.pow((nu / (ng + eps)).clamp_min(eps), align_gamma).detach()
+            v_g_aligned = scale_factor * v_g
+
+            if mode == "magnitude_only":
+                v_m = v_u + v_g_aligned
+            else:
+                if float(cos.item()) >= 0.0:
+                    v_m = v_u + v_g_aligned
+                else:
+                    proj_coeff = torch.dot(v_g_aligned, v_u) / torch.dot(v_u, v_u).clamp_min(eps)
+                    v_g_perp = v_g_aligned - proj_coeff * v_u
+                    if bool(norm_restore):
+                        ng_aligned = torch.linalg.norm(v_g_aligned)
+                        ng_perp = torch.linalg.norm(v_g_perp)
+                        v_g_perp = v_g_perp * (ng_aligned / (ng_perp + eps))
+                    v_m = v_u + v_g_perp
+
+        off = 0
+        for i in idxs:
+            ref = wg_u[i]
+            n = int(ref.numel())
+            merged_enc[i] = v_m[off : off + n].view_as(ref)
+            off += n
+
+    _set_grads(enc_params, merged_enc)
+    _set_grads(cls_params, [float(lambda_u) * g for g in cls_grads])
+    _set_grads(dec_params, [float(lambda_g) * g for g in dec_grads])
+
+    return float(_safe_cosine(_flatten(gu_list), _flatten(gg_list)))
+
+
+def _run_laga_gbvc_step(
+    *,
+    loss_u: torch.Tensor,
+    loss_g: torch.Tensor,
+    loss_gbvc: torch.Tensor,
+    enc_named: List[Tuple[str, nn.Parameter]],
+    cls_params: List[nn.Parameter],
+    dec_params: List[nn.Parameter],
+    lambda_u: float,
+    lambda_g: float,
+    lambda_gbvc: float,
+    eps: float = 1e-12,
+) -> float:
+    """Vanilla LAGA + GBVC regularization on encoder features."""
+    enc_params = [p for _, p in enc_named]
+
+    gu_list = _materialize_grads(loss_u, enc_params, retain_graph=True)
+    gg_list = _materialize_grads(loss_g, enc_params, retain_graph=True)
+    ggvc_list = _materialize_grads(loss_gbvc, enc_params, retain_graph=True)
+    cls_grads = _materialize_grads(loss_u, cls_params, retain_graph=True)
+    dec_grads = _materialize_grads(loss_g, dec_params, retain_graph=False)
+
+    wg_u = [float(lambda_u) * g for g in gu_list]
+    wg_g = [float(lambda_g) * g for g in gg_list]
+
+    merged_enc = [u + g for u, g in zip(wg_u, wg_g)]
+
+    block_to_indices: Dict[int, List[int]] = {k: [] for k in range(12)}
+    for idx, (name, _) in enumerate(enc_named):
+        m = re.match(r"^blocks\.(\d+)\.", name)
+        if m is None:
+            continue
+        k = int(m.group(1))
+        if 0 <= k <= 11:
+            block_to_indices[k].append(idx)
+
+    eps = float(max(1e-12, eps))
+
+    for k in range(12):
+        idxs = block_to_indices[k]
+        if len(idxs) == 0:
+            continue
+
+        u_block = [wg_u[i] for i in idxs]
+        g_block = [wg_g[i] for i in idxs]
+        v_u = _flatten(u_block)
+        v_g = _flatten(g_block)
+
+        dot = torch.dot(v_u, v_g)
+        nu = torch.linalg.norm(v_u)
+        ng = torch.linalg.norm(v_g)
+        cos = dot / (nu * ng + eps)
+
+        if float(cos.item()) >= 0.0:
+            v_m = v_u + v_g
+        else:
+            proj_coeff = dot / torch.dot(v_u, v_u).clamp_min(eps)
+            v_g_proj = v_g - proj_coeff * v_u
+            v_m = v_u + v_g_proj
+
+        off = 0
+        for i in idxs:
+            ref = wg_u[i]
+            n = int(ref.numel())
+            merged_enc[i] = v_m[off : off + n].view_as(ref)
+            off += n
+
+    if float(lambda_gbvc) != 0.0:
+        merged_enc = [g + float(lambda_gbvc) * gv for g, gv in zip(merged_enc, ggvc_list)]
+
+    _set_grads(enc_params, merged_enc)
+    _set_grads(cls_params, [float(lambda_u) * g for g in cls_grads])
+    _set_grads(dec_params, [float(lambda_g) * g for g in dec_grads])
+
+    return float(_safe_cosine(_flatten(gu_list), _flatten(gg_list)))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser("IN100 Multi-Method Benchmark with DINO-Small")
 
@@ -251,7 +588,19 @@ def main() -> None:
         "--method",
         type=str,
         default="joint",
-        choices=["und_only", "gen_only", "joint", "pcgrad", "cagrad", "lacar"],
+        choices=[
+            "und_only",
+            "gen_only",
+            "joint",
+            "pcgrad",
+            "cagrad",
+            "la_cagrad",
+            "gma_laga",
+            "lacar",
+            "laga",
+            "ma_laga",
+            "laga_gbvc",
+        ],
         help="Experiment branch selector.",
     )
     parser.add_argument("--encoder_init", type=str, default="dinov2", choices=["scratch", "dinov2"])
@@ -278,6 +627,19 @@ def main() -> None:
     parser.add_argument("--lambda_u", type=float, default=1.0)
     parser.add_argument("--lambda_g", type=float, default=1.0)
     parser.add_argument(
+        "--recon_loss_type",
+        type=str,
+        default="mse",
+        choices=["mse", "rmse"],
+        help="Reconstruction objective used for backward (mse or rmse).",
+    )
+    parser.add_argument(
+        "--recon_rmse_eps",
+        type=float,
+        default=1e-12,
+        help="Numerical epsilon in sqrt(mse + eps) when recon_loss_type=rmse.",
+    )
+    parser.add_argument(
         "--auto_align_lambda_g",
         action="store_true",
         default=True,
@@ -286,9 +648,42 @@ def main() -> None:
     parser.add_argument("--disable_auto_align_lambda_g", action="store_true")
 
     parser.add_argument("--cagrad_beta", type=float, default=0.35)
+    parser.add_argument(
+        "--gma_laga_max_scale",
+        type=float,
+        default=100.0,
+        help="Global generation scale cap for GMA-LAGA.",
+    )
+    parser.add_argument(
+        "--ma_laga_mode",
+        type=str,
+        default="full",
+        choices=["full", "capped_full", "direction_only", "magnitude_only", "nr_laga"],
+        help="MA-LAGA ablation mode.",
+    )
+    parser.add_argument(
+        "--ma_laga_align_gamma",
+        type=float,
+        default=1.0,
+        help="Magnitude alignment strength. 1.0 means strict norm matching.",
+    )
+    parser.add_argument(
+        "--ma_laga_max_scale",
+        type=float,
+        default=3.0,
+        help="Cap for alignment scale in ma_laga_mode=capped_full.",
+    )
+    parser.add_argument(
+        "--ma_laga_norm_restore",
+        action="store_true",
+        default=False,
+        help="If enabled, restore aligned generation norm after conflict projection.",
+    )
     parser.add_argument("--lambda_var", type=float, default=0.20)
     parser.add_argument("--var_gamma", type=float, default=1.0)
     parser.add_argument("--var_eps", type=float, default=1e-4)
+    parser.add_argument("--lambda_gbvc", type=float, default=0.1)
+    parser.add_argument("--gbvc_nu", type=float, default=1.0)
 
     parser.add_argument("--decoder_dim", type=int, default=384)
     parser.add_argument("--decoder_depth", type=int, default=4)
@@ -319,6 +714,14 @@ def main() -> None:
         args.auto_align_lambda_g = False
     if args.no_final_eval_rfid:
         args.final_eval_rfid = False
+    if float(args.gma_laga_max_scale) <= 0.0:
+        raise ValueError(f"gma_laga_max_scale must be > 0, got {args.gma_laga_max_scale}")
+    if float(args.recon_rmse_eps) <= 0.0:
+        raise ValueError(f"recon_rmse_eps must be > 0, got {args.recon_rmse_eps}")
+    if float(args.ma_laga_align_gamma) < 0.0:
+        raise ValueError(f"ma_laga_align_gamma must be >= 0, got {args.ma_laga_align_gamma}")
+    if str(args.ma_laga_mode) == "capped_full" and float(args.ma_laga_max_scale) <= 0.0:
+        raise ValueError(f"ma_laga_max_scale must be > 0 for capped_full, got {args.ma_laga_max_scale}")
 
     is_distributed, rank, world_size, local_rank = _init_distributed()
     is_main_process = rank == 0
@@ -421,6 +824,7 @@ def main() -> None:
 
     encoder_groups = _group_encoder_params(base_model.encoder)
     enc_named, cls_named, dec_named, shared_params, aux_params = _build_param_groups(base_model)
+    encoder_group_indices = _build_encoder_group_indices(enc_named)
     cls_params = [p for _, p in cls_named]
     dec_params = [p for _, p in dec_named]
 
@@ -465,13 +869,18 @@ def main() -> None:
         gt_patches = base_model.patchify(images_01)
 
         loss_u = F.cross_entropy(logits, labels)
-        loss_g = F.mse_loss(pred_patches, gt_patches)
+        loss_g, loss_g_mse = _build_recon_objective(
+            pred_patches,
+            gt_patches,
+            loss_type=str(args.recon_loss_type),
+            rmse_eps=float(args.recon_rmse_eps),
+        )
 
         # Step-0 自动损失对齐：lambda_g = detach(Lu/Lg)
         if (
             (not aligned_once)
             and args.auto_align_lambda_g
-            and (args.method in {"joint", "pcgrad", "cagrad", "lacar"})
+            and (args.method in {"joint", "pcgrad", "cagrad", "la_cagrad", "gma_laga", "lacar", "laga", "ma_laga", "laga_gbvc"})
         ):
             lu_mean = _reduce_mean_scalar(float(loss_u.detach().item()), device, is_distributed, world_size)
             lg_mean = _reduce_mean_scalar(float(loss_g.detach().item()), device, is_distributed, world_size)
@@ -484,11 +893,16 @@ def main() -> None:
                 )
 
         loss_var = torch.tensor(0.0, device=device)
+        loss_gbvc = torch.tensor(0.0, device=device)
         if args.method == "lacar":
             # 用 encoder patch token 均值做方差约束，抑制表征坍缩。
             patch_tokens = outputs["tokens"][:, -base_model.num_patches :]
             feat_for_var = patch_tokens.mean(dim=1)
             loss_var = fvr_loss(feat_for_var)
+        elif args.method == "laga_gbvc":
+            z = outputs["tokens"]
+            variance_z = torch.var(z, dim=0).mean()
+            loss_gbvc = torch.relu(torch.tensor(float(args.gbvc_nu), device=device) - variance_z)
 
         should_probe = (
             global_step <= int(args.probe_until)
@@ -506,6 +920,8 @@ def main() -> None:
                 global_step=global_step,
                 encoder_groups=encoder_groups,
                 enc_named=enc_named,
+                recon_loss_type=str(args.recon_loss_type),
+                recon_rmse_eps=float(args.recon_rmse_eps),
             )
 
         optimizer.zero_grad(set_to_none=True)
@@ -558,6 +974,31 @@ def main() -> None:
                 beta=float(args.cagrad_beta),
             )
 
+        elif args.method == "la_cagrad":
+            train_grad_cos = apply_la_cagrad(
+                loss_txt=loss_u,
+                loss_rec=loss_g,
+                shared_params=shared_params,
+                aux_params=aux_params,
+                group_to_indices=encoder_group_indices,
+                lambda_txt=float(args.lambda_u),
+                lambda_rec=float(runtime_lambda_g),
+                beta=float(args.cagrad_beta),
+            )
+
+        elif args.method == "gma_laga":
+            train_grad_cos = apply_gma_laga(
+                loss_txt=loss_u,
+                loss_rec=loss_g,
+                shared_params=shared_params,
+                aux_params=aux_params,
+                group_to_indices=encoder_group_indices,
+                lambda_txt=float(args.lambda_u),
+                lambda_rec=float(runtime_lambda_g),
+                max_scale=float(args.gma_laga_max_scale),
+                eps=1e-8,
+            )
+
         elif args.method == "lacar":
             train_grad_cos = _run_lacar_step(
                 loss_u=loss_u,
@@ -571,6 +1012,46 @@ def main() -> None:
                 lambda_var=float(args.lambda_var),
             )
 
+        elif args.method == "laga":
+            train_grad_cos = _run_laga_step(
+                loss_u=loss_u,
+                loss_g=loss_g,
+                enc_named=enc_named,
+                cls_params=cls_params,
+                dec_params=dec_params,
+                lambda_u=float(args.lambda_u),
+                lambda_g=float(runtime_lambda_g),
+            )
+
+        elif args.method == "ma_laga":
+            train_grad_cos = _run_ma_laga_step(
+                loss_u=loss_u,
+                loss_g=loss_g,
+                enc_named=enc_named,
+                cls_params=cls_params,
+                dec_params=dec_params,
+                lambda_u=float(args.lambda_u),
+                lambda_g=float(runtime_lambda_g),
+                align_gamma=float(args.ma_laga_align_gamma),
+                align_max_scale=float(args.ma_laga_max_scale),
+                norm_restore=bool(args.ma_laga_norm_restore),
+                mode=str(args.ma_laga_mode),
+                eps=1e-8,
+            )
+
+        elif args.method == "laga_gbvc":
+            train_grad_cos = _run_laga_gbvc_step(
+                loss_u=loss_u,
+                loss_g=loss_g,
+                loss_gbvc=loss_gbvc,
+                enc_named=enc_named,
+                cls_params=cls_params,
+                dec_params=dec_params,
+                lambda_u=float(args.lambda_u),
+                lambda_g=float(runtime_lambda_g),
+                lambda_gbvc=float(args.lambda_gbvc),
+            )
+
         else:
             raise ValueError(f"Unsupported method={args.method}")
 
@@ -580,7 +1061,7 @@ def main() -> None:
 
         with torch.no_grad():
             acc = (logits.argmax(dim=-1) == labels).float().mean()
-            rmse = torch.sqrt(loss_g.detach().clamp_min(0.0))
+            rmse = torch.sqrt(loss_g_mse.detach().clamp_min(0.0))
             loss_u_weighted = float(args.lambda_u) * loss_u
             if args.method == "gen_only":
                 loss_g_weighted = loss_g
@@ -588,6 +1069,8 @@ def main() -> None:
                 loss_g_weighted = float(runtime_lambda_g) * loss_g
             if args.method == "lacar":
                 total_loss = loss_u_weighted + loss_g_weighted + float(args.lambda_var) * loss_var
+            elif args.method == "laga_gbvc":
+                total_loss = loss_u_weighted + loss_g_weighted + float(args.lambda_gbvc) * loss_gbvc
             elif args.method == "und_only":
                 total_loss = loss_u_weighted
             elif args.method == "gen_only":
@@ -597,7 +1080,9 @@ def main() -> None:
 
         loss_u_log = _reduce_mean_scalar(float(loss_u.detach().item()), device, is_distributed, world_size)
         loss_g_log = _reduce_mean_scalar(float(loss_g.detach().item()), device, is_distributed, world_size)
+        loss_g_mse_log = _reduce_mean_scalar(float(loss_g_mse.detach().item()), device, is_distributed, world_size)
         loss_var_log = _reduce_mean_scalar(float(loss_var.detach().item()), device, is_distributed, world_size)
+        loss_gbvc_log = _reduce_mean_scalar(float(loss_gbvc.detach().item()), device, is_distributed, world_size)
         loss_total_log = _reduce_mean_scalar(float(total_loss.detach().item()), device, is_distributed, world_size)
         acc_log = _reduce_mean_scalar(float(acc.item()), device, is_distributed, world_size)
         rmse_log = _reduce_mean_scalar(float(rmse.item()), device, is_distributed, world_size)
@@ -614,13 +1099,17 @@ def main() -> None:
             "method": str(args.method),
             "loss_u": float(loss_u_log),
             "loss_g": float(loss_g_log),
+            "loss_g_mse": float(loss_g_mse_log),
             "loss_var": float(loss_var_log),
+            "loss_gbvc": float(loss_gbvc_log),
             "loss_u_weighted": float(loss_u_weighted_log),
             "loss_g_weighted": float(loss_g_weighted_log),
             "loss_total": float(loss_total_log),
+            "recon_loss_type": str(args.recon_loss_type),
             "lambda_u": float(args.lambda_u),
             "lambda_g": float(runtime_lambda_g),
             "lambda_var": float(args.lambda_var if args.method == "lacar" else 0.0),
+            "lambda_gbvc": float(args.lambda_gbvc if args.method == "laga_gbvc" else 0.0),
             "train_grad_cosine": float(train_grad_cos),
             "acc": float(acc_log),
             "rmse": float(rmse_log),
