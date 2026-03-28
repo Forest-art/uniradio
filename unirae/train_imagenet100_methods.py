@@ -173,6 +173,63 @@ def _build_encoder_group_indices(enc_named: List[Tuple[str, nn.Parameter]]) -> D
     return groups
 
 
+def _build_encoder_group_indices_coarse(enc_named: List[Tuple[str, nn.Parameter]]) -> Dict[str, List[int]]:
+    """Build coarse layer-wise groups to reduce per-block routing noise."""
+    groups: Dict[str, List[int]] = {}
+    for idx, (name, _) in enumerate(enc_named):
+        if name.startswith("patch_embed") or name.startswith("cls_token") or name.startswith("pos_embed"):
+            gname = "stem"
+        elif name.startswith("register_tokens"):
+            gname = "stem"
+        elif name.startswith("blocks."):
+            parts = name.split(".")
+            try:
+                block_id = int(parts[1]) if len(parts) > 1 else 0
+            except ValueError:
+                block_id = 0
+            if block_id <= 3:
+                gname = "blocks.0_3"
+            elif block_id <= 7:
+                gname = "blocks.4_7"
+            else:
+                gname = "blocks.8_11"
+        elif name.startswith("norm"):
+            gname = "norm"
+        else:
+            gname = "other"
+        groups.setdefault(gname, []).append(idx)
+    return groups
+
+
+def _encoder_group_depth_ratio(group_name: str) -> float:
+    """Approximate semantic depth for encoder groups.
+
+    Early stem groups are allowed to absorb more reconstruction signal, while
+    deeper blocks are more strongly anchored to semantics.
+    """
+    name = str(group_name)
+    if name in {"patch_embed", "embeddings", "stem"}:
+        return 0.0
+    if name == "norm":
+        return 1.0
+    if name.startswith("blocks."):
+        suffix = name.split(".", 1)[1]
+        if "_" in suffix:
+            try:
+                hi = int(suffix.split("_")[-1])
+            except ValueError:
+                return 0.5
+            return max(0.0, min(1.0, float(hi + 1) / 12.0))
+        try:
+            block_id = int(suffix)
+        except ValueError:
+            return 0.5
+        return max(0.0, min(1.0, float(block_id + 1) / 12.0))
+    if name == "global":
+        return 0.5
+    return 0.5
+
+
 def _build_recon_objective(
     pred_patches: torch.Tensor,
     gt_patches: torch.Tensor,
@@ -398,7 +455,11 @@ def _run_ma_laga_step(
     align_max_scale: float = 0.0,
     norm_restore: bool = False,
     mode: str = "full",
+    group_to_indices: Optional[Dict[str, List[int]]] = None,
+    conflict_tau: float = 0.0,
     eps: float = 1e-8,
+    encoder_rec_gate_strength: float = 0.0,
+    encoder_rec_gate_min: float = 1.0,
 ) -> float:
     """MA-LAGA family on ViT blocks.
 
@@ -416,24 +477,32 @@ def _run_ma_laga_step(
     cls_grads = _materialize_grads(loss_u, cls_params, retain_graph=True)
     dec_grads = _materialize_grads(loss_g, dec_params, retain_graph=False)
 
-    # Keep fairness protocol: apply task weights before block arbitration.
+    # Keep fairness protocol: apply task weights before group arbitration.
     wg_u = [float(lambda_u) * g for g in gu_list]
     wg_g = [float(lambda_g) * g for g in gg_list]
 
     merged_enc = [u + g for u, g in zip(wg_u, wg_g)]
 
-    block_to_indices: Dict[int, List[int]] = {k: [] for k in range(12)}
-    for idx, (name, _) in enumerate(enc_named):
-        m = re.match(r"^blocks\.(\d+)\.", name)
-        if m is None:
+    if group_to_indices is None:
+        group_to_indices = _build_encoder_group_indices(enc_named)
+
+    valid_groups: List[Tuple[str, List[int]]] = []
+    for group_name, raw_indices in group_to_indices.items():
+        idxs = [int(i) for i in raw_indices if 0 <= int(i) < len(enc_named)]
+        if len(idxs) == 0:
             continue
-        k = int(m.group(1))
-        if 0 <= k <= 11:
-            block_to_indices[k].append(idx)
+        # Keep deterministic order and remove duplicates.
+        idxs = list(dict.fromkeys(idxs))
+        valid_groups.append((str(group_name), idxs))
+    if len(valid_groups) == 0:
+        valid_groups = [("global", list(range(len(enc_named))))]
 
     eps = float(max(1e-8, eps))
     align_gamma = float(max(0.0, align_gamma))
     align_max_scale = float(align_max_scale)
+    conflict_tau = float(max(0.0, conflict_tau))
+    encoder_rec_gate_strength = float(max(0.0, encoder_rec_gate_strength))
+    encoder_rec_gate_min = float(min(1.0, max(0.0, encoder_rec_gate_min)))
     mode = str(mode).lower()
     if mode not in {"full", "capped_full", "direction_only", "magnitude_only", "nr_laga"}:
         raise ValueError(
@@ -445,30 +514,31 @@ def _run_ma_laga_step(
             f"ma_laga_mode=capped_full requires ma_laga_max_scale>0, got {align_max_scale}"
         )
 
-    for k in range(12):
-        idxs = block_to_indices[k]
-        if len(idxs) == 0:
-            continue
-
+    for group_name, idxs in valid_groups:
         u_block = [wg_u[i] for i in idxs]
         g_block = [wg_g[i] for i in idxs]
         v_u = _flatten(u_block)
-        v_g = _flatten(g_block)
+        rec_gate = 1.0
+        if encoder_rec_gate_strength > 0.0:
+            depth_ratio = _encoder_group_depth_ratio(group_name)
+            rec_gate = max(encoder_rec_gate_min, 1.0 - encoder_rec_gate_strength * depth_ratio)
+        v_g = rec_gate * _flatten(g_block)
 
         dot = torch.dot(v_u, v_g)
         nu = torch.linalg.norm(v_u)
         ng = torch.linalg.norm(v_g)
         cos = dot / (nu * ng + eps)
+        is_conflict = float(cos.item()) < -conflict_tau
 
         if mode == "direction_only":
-            if float(cos.item()) >= 0.0:
+            if not is_conflict:
                 v_m = v_u + v_g
             else:
                 proj_coeff = dot / torch.dot(v_u, v_u).clamp_min(eps)
                 v_g_perp = v_g - proj_coeff * v_u
                 v_m = v_u + v_g_perp
         elif mode == "nr_laga":
-            if float(cos.item()) >= 0.0:
+            if not is_conflict:
                 v_m = v_u + v_g
             else:
                 proj_coeff = dot / torch.dot(v_u, v_u).clamp_min(eps)
@@ -486,7 +556,7 @@ def _run_ma_laga_step(
             if mode == "magnitude_only":
                 v_m = v_u + v_g_aligned
             else:
-                if float(cos.item()) >= 0.0:
+                if not is_conflict:
                     v_m = v_u + v_g_aligned
                 else:
                     proj_coeff = torch.dot(v_g_aligned, v_u) / torch.dot(v_u, v_u).clamp_min(eps)
@@ -607,6 +677,7 @@ def main() -> None:
             "lacar",
             "laga",
             "ma_laga",
+            "enc_anchor_dsga",
             "laga_gbvc",
         ],
         help="Experiment branch selector.",
@@ -687,6 +758,37 @@ def main() -> None:
         default=False,
         help="If enabled, restore aligned generation norm after conflict projection.",
     )
+    parser.add_argument(
+        "--ma_laga_grouping",
+        type=str,
+        default="layerwise",
+        choices=["layerwise", "layerwise_coarse", "global"],
+        help="MA-LAGA grouping scope: fine layerwise, coarse layerwise, or a single global group.",
+    )
+    parser.add_argument(
+        "--enc_anchor_rec_gate_strength",
+        type=float,
+        default=0.75,
+        help="Depth-aware suppression strength for reconstruction gradients on encoder groups.",
+    )
+    parser.add_argument(
+        "--enc_anchor_rec_gate_min",
+        type=float,
+        default=0.20,
+        help="Minimum reconstruction gate kept on the deepest encoder groups.",
+    )
+    parser.add_argument(
+        "--ma_laga_conflict_tau",
+        type=float,
+        default=0.0,
+        help="Conflict margin: project only when cosine < -tau.",
+    )
+    parser.add_argument(
+        "--ma_laga_conflict_tau_end",
+        type=float,
+        default=-1.0,
+        help="If >=0, linearly anneal tau from ma_laga_conflict_tau to this value across training.",
+    )
     parser.add_argument("--lambda_var", type=float, default=0.20)
     parser.add_argument("--var_gamma", type=float, default=1.0)
     parser.add_argument("--var_eps", type=float, default=1e-4)
@@ -728,6 +830,20 @@ def main() -> None:
         raise ValueError(f"recon_rmse_eps must be > 0, got {args.recon_rmse_eps}")
     if float(args.ma_laga_align_gamma) < 0.0:
         raise ValueError(f"ma_laga_align_gamma must be >= 0, got {args.ma_laga_align_gamma}")
+    if float(args.enc_anchor_rec_gate_strength) < 0.0:
+        raise ValueError(
+            f"enc_anchor_rec_gate_strength must be >= 0, got {args.enc_anchor_rec_gate_strength}"
+        )
+    if not (0.0 <= float(args.enc_anchor_rec_gate_min) <= 1.0):
+        raise ValueError(
+            f"enc_anchor_rec_gate_min must be in [0, 1], got {args.enc_anchor_rec_gate_min}"
+        )
+    if float(args.ma_laga_conflict_tau) < 0.0:
+        raise ValueError(f"ma_laga_conflict_tau must be >= 0, got {args.ma_laga_conflict_tau}")
+    if float(args.ma_laga_conflict_tau_end) < 0.0 and float(args.ma_laga_conflict_tau_end) != -1.0:
+        raise ValueError(
+            f"ma_laga_conflict_tau_end must be -1 (disabled) or >= 0, got {args.ma_laga_conflict_tau_end}"
+        )
     if str(args.ma_laga_mode) == "capped_full" and float(args.ma_laga_max_scale) <= 0.0:
         raise ValueError(f"ma_laga_max_scale must be > 0 for capped_full, got {args.ma_laga_max_scale}")
 
@@ -833,6 +949,13 @@ def main() -> None:
     encoder_groups = _group_encoder_params(base_model.encoder)
     enc_named, cls_named, dec_named, shared_params, aux_params = _build_param_groups(base_model)
     encoder_group_indices = _build_encoder_group_indices(enc_named)
+    grouping_mode = str(args.ma_laga_grouping).lower()
+    if grouping_mode == "global":
+        ma_laga_group_indices = {"global": list(range(len(enc_named)))}
+    elif grouping_mode == "layerwise_coarse":
+        ma_laga_group_indices = _build_encoder_group_indices_coarse(enc_named)
+    else:
+        ma_laga_group_indices = dict(encoder_group_indices)
     cls_params = [p for _, p in cls_named]
     dec_params = [p for _, p in dec_named]
 
@@ -840,6 +963,8 @@ def main() -> None:
     std = torch.tensor(IMAGENET_STD, dtype=torch.float32, device=device).view(1, 3, 1, 1)
 
     runtime_lambda_g = float(args.lambda_g)
+    tau_start = float(args.ma_laga_conflict_tau)
+    tau_end = float(args.ma_laga_conflict_tau_end) if float(args.ma_laga_conflict_tau_end) >= 0.0 else tau_start
     aligned_once = False
 
     global_step = 0
@@ -866,6 +991,10 @@ def main() -> None:
             images, labels = next(train_iter)
 
         global_step += 1
+        if int(args.max_steps) > 1:
+            tau_now = tau_start + (tau_end - tau_start) * (float(global_step - 1) / float(int(args.max_steps) - 1))
+        else:
+            tau_now = tau_end
 
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
@@ -890,7 +1019,19 @@ def main() -> None:
             and args.auto_align_lambda_g
             and (
                 args.method
-                in {"joint", "pcgrad", "cagrad", "la_cagrad", "gma_laga", "egd", "lacar", "laga", "ma_laga", "laga_gbvc"}
+                in {
+                    "joint",
+                    "pcgrad",
+                    "cagrad",
+                    "la_cagrad",
+                    "gma_laga",
+                    "egd",
+                    "lacar",
+                    "laga",
+                    "ma_laga",
+                    "enc_anchor_dsga",
+                    "laga_gbvc",
+                }
             )
         ):
             lu_mean = _reduce_mean_scalar(float(loss_u.detach().item()), device, is_distributed, world_size)
@@ -1059,7 +1200,31 @@ def main() -> None:
                 align_max_scale=float(args.ma_laga_max_scale),
                 norm_restore=bool(args.ma_laga_norm_restore),
                 mode=str(args.ma_laga_mode),
+                group_to_indices=ma_laga_group_indices,
+                conflict_tau=float(tau_now),
                 eps=1e-8,
+                encoder_rec_gate_strength=0.0,
+                encoder_rec_gate_min=1.0,
+            )
+
+        elif args.method == "enc_anchor_dsga":
+            train_grad_cos = _run_ma_laga_step(
+                loss_u=loss_u,
+                loss_g=loss_g,
+                enc_named=enc_named,
+                cls_params=cls_params,
+                dec_params=dec_params,
+                lambda_u=float(args.lambda_u),
+                lambda_g=float(runtime_lambda_g),
+                align_gamma=float(args.ma_laga_align_gamma),
+                align_max_scale=float(args.ma_laga_max_scale),
+                norm_restore=bool(args.ma_laga_norm_restore),
+                mode=str(args.ma_laga_mode),
+                group_to_indices=ma_laga_group_indices,
+                conflict_tau=float(tau_now),
+                eps=1e-8,
+                encoder_rec_gate_strength=float(args.enc_anchor_rec_gate_strength),
+                encoder_rec_gate_min=float(args.enc_anchor_rec_gate_min),
             )
 
         elif args.method == "laga_gbvc":
@@ -1120,6 +1285,10 @@ def main() -> None:
         row = {
             "step": int(global_step),
             "method": str(args.method),
+            "ma_laga_grouping": str(args.ma_laga_grouping),
+            "ma_laga_conflict_tau": float(args.ma_laga_conflict_tau),
+            "ma_laga_conflict_tau_now": float(tau_now),
+            "ma_laga_conflict_tau_end": float(args.ma_laga_conflict_tau_end),
             "loss_u": float(loss_u_log),
             "loss_g": float(loss_g_log),
             "loss_g_mse": float(loss_g_mse_log),
