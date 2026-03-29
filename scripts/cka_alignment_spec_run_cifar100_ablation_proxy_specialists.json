@@ -1,0 +1,62 @@
+{
+  "model_family": "cifar_tradeoff",
+  "dataset": {
+    "name": "cifar100",
+    "root": "/project/peilab/luxiaocheng/projects/DSGA/data/cifar100",
+    "split": "test",
+    "image_size": 32,
+    "batch_size": 128,
+    "num_workers": 4,
+    "max_batches": 0,
+    "max_samples": 512
+  },
+  "stages": {
+    "initial": "Initial",
+    "middle": "Middle",
+    "converged": "Converged"
+  },
+  "specialists": {
+    "understanding": {
+      "config": "/project/peilab/luxiaocheng/projects/DSGA/runs/cifar100_b5_s42_20260223_113334_text_only_s42/run_config.yaml",
+      "stages": {
+        "initial": "INIT",
+        "middle": "/project/peilab/luxiaocheng/projects/DSGA/runs/cifar100_b5_s42_20260223_113334_text_only_s42",
+        "converged": "/project/peilab/luxiaocheng/projects/DSGA/runs/cifar100_b5_s42_20260223_113334_text_only_s42"
+      }
+    },
+    "generation": {
+      "config": "/project/peilab/luxiaocheng/projects/DSGA/runs/cifar100_b5_s42_20260223_113334_recon_only_s42/run_config.yaml",
+      "stages": {
+        "initial": "INIT",
+        "middle": "/project/peilab/luxiaocheng/projects/DSGA/runs/cifar100_b5_s42_20260223_113334_recon_only_s42",
+        "converged": "/project/peilab/luxiaocheng/projects/DSGA/runs/cifar100_b5_s42_20260223_113334_recon_only_s42"
+      }
+    }
+  },
+  "methods": {
+    "Vanilla Joint": {
+      "config": "/project/peilab/luxiaocheng/projects/DSGA/runs/cifar100_patch4_ma_laga_ablation20k_vanilla_naive_s42_20260303_003056/run_config.yaml",
+      "stages": {
+        "initial": "INIT",
+        "middle": "/project/peilab/luxiaocheng/projects/DSGA/runs/cifar100_patch4_ma_laga_ablation20k_vanilla_naive_s42_20260303_003056",
+        "converged": "/project/peilab/luxiaocheng/projects/DSGA/runs/cifar100_patch4_ma_laga_ablation20k_vanilla_naive_s42_20260303_003056"
+      }
+    },
+    "CAGrad": {
+      "config": "/project/peilab/luxiaocheng/projects/DSGA/runs/cifar100_patch4_ma_laga_ablation20k_cagrad_b0p5_s42_20260303_003056/run_config.yaml",
+      "stages": {
+        "initial": "INIT",
+        "middle": "/project/peilab/luxiaocheng/projects/DSGA/runs/cifar100_patch4_ma_laga_ablation20k_cagrad_b0p5_s42_20260303_003056",
+        "converged": "/project/peilab/luxiaocheng/projects/DSGA/runs/cifar100_patch4_ma_laga_ablation20k_cagrad_b0p5_s42_20260303_003056"
+      }
+    },
+    "DSGA": {
+      "config": "/project/peilab/luxiaocheng/projects/DSGA/runs/cifar100_patch4_ma_laga_ablation20k_full_ma_laga_s42_20260303_003056/run_config.yaml",
+      "stages": {
+        "initial": "INIT",
+        "middle": "/project/peilab/luxiaocheng/projects/DSGA/runs/cifar100_patch4_ma_laga_ablation20k_full_ma_laga_s42_20260303_003056",
+        "converged": "/project/peilab/luxiaocheng/projects/DSGA/runs/cifar100_patch4_ma_laga_ablation20k_full_ma_laga_s42_20260303_003056"
+      }
+    }
+  }
+}

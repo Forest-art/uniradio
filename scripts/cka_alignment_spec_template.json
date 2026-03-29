@@ -1,0 +1,62 @@
+{
+  "model_family": "cifar_tradeoff",
+  "dataset": {
+    "name": "cifar100",
+    "root": "/project/peilab/luxiaocheng/projects/DSGA/data/cifar100",
+    "split": "test",
+    "image_size": 32,
+    "batch_size": 128,
+    "num_workers": 4,
+    "max_batches": 0,
+    "max_samples": 1024
+  },
+  "stages": {
+    "initial": "Initial",
+    "middle": "Middle",
+    "converged": "Converged"
+  },
+  "specialists": {
+    "understanding": {
+      "config": "/abs/path/to/text_only_run_config.yaml",
+      "stages": {
+        "initial": "INIT",
+        "middle": "/abs/path/to/text_specialist_mid_run_or_ckpt",
+        "converged": "/abs/path/to/text_specialist_final_run_or_ckpt"
+      }
+    },
+    "generation": {
+      "config": "/abs/path/to/recon_only_run_config.yaml",
+      "stages": {
+        "initial": "INIT",
+        "middle": "/abs/path/to/gen_specialist_mid_run_or_ckpt",
+        "converged": "/abs/path/to/gen_specialist_final_run_or_ckpt"
+      }
+    }
+  },
+  "methods": {
+    "Vanilla Joint": {
+      "config": "/abs/path/to/vanilla_joint_run_config.yaml",
+      "stages": {
+        "initial": "INIT",
+        "middle": "/abs/path/to/vanilla_mid_run_or_ckpt",
+        "converged": "/abs/path/to/vanilla_final_run_or_ckpt"
+      }
+    },
+    "CAGrad": {
+      "config": "/abs/path/to/cagrad_run_config.yaml",
+      "stages": {
+        "initial": "INIT",
+        "middle": "/abs/path/to/cagrad_mid_run_or_ckpt",
+        "converged": "/abs/path/to/cagrad_final_run_or_ckpt"
+      }
+    },
+    "DSGA": {
+      "config": "/abs/path/to/dsga_run_config.yaml",
+      "stages": {
+        "initial": "INIT",
+        "middle": "/abs/path/to/dsga_mid_run_or_ckpt",
+        "converged": "/abs/path/to/dsga_final_run_or_ckpt"
+      }
+    }
+  }
+}

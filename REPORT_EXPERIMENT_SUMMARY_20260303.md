@@ -1,4 +1,4 @@
-# UniRadio Experiment Summary (up to 2026-03-03)
+# DSGA Experiment Summary (up to 2026-03-03)
 
 ## Scope
 - This report summarizes the latest reproducible comparison tables discussed in this round.

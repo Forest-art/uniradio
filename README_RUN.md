@@ -2,7 +2,7 @@
 
 ## 1) Environment
 ```bash
-cd /project/peilab/luxiaocheng/projects/unirae_radio
+cd /project/peilab/luxiaocheng/projects/DSGA
 pip install -r requirements.txt
 ```
 
@@ -11,7 +11,18 @@ pip install -r requirements.txt
 
 `train_cifar10` is now intentionally simplified to only support:
 - `train.mode`: `joint | text_only | recon_only`
-- `train.grad_strategy` (joint mode only): `naive | pcgrad | cagrad`
+- `train.grad_strategy` (joint mode only): `naive | pcgrad | cagrad | saop | laga | dsga`
+  - legacy alias still accepted: `ma_laga` (mapped to DSGA path)
+
+For `train.grad_strategy=dsga`, use the new naming:
+- `train.dsga_m_align_gamma`: DSGA-M (magnitude alignment) gamma
+- `train.dsga_m_scope`: DSGA-M scope: `global | layerwise` (default `global`)
+- `train.dsga_m_norm_restore`: DSGA-M norm restore switch
+- `train.dsga_m_eps`: DSGA-M epsilon
+- `train.dsga_d_mode`: DSGA-D (direction decomposition) mode: `full | direction_only | magnitude_only`
+
+Legacy aliases are still accepted for compatibility:
+- `train.ma_laga_align_gamma`, `train.ma_laga_m_scope`, `train.ma_laga_norm_restore`, `train.ma_laga_eps`, `train.ma_laga_mode`
 
 No layer-wise, MGDA, consistency, or SupCon training paths are active in this baseline stage.
 
@@ -193,7 +204,7 @@ python -m accelerate.commands.launch --num_processes 8 --num_machines 1 -m unira
 
 8 卡直跑（HF `load_from_disk`）：
 ```bash
-cd /project/peilab/luxiaocheng/projects/unirae_radio
+cd /project/peilab/luxiaocheng/projects/DSGA
 
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 python -m accelerate.commands.launch --num_processes 8 --num_machines 1 -m unirae.train_dino_decoder_only \
@@ -212,7 +223,7 @@ python -m accelerate.commands.launch --num_processes 8 --num_machines 1 -m unira
 - 训练：`loss/mse/psnr`
 - 评估：`[eval][step=...] {recon_loss, mse, psnr, num_samples}`
 
-## 13) DINO RAE Stage-1 Full（uniradio 内集成训练+评测）
+## 13) DINO RAE Stage-1 Full（DSGA 内集成训练+评测）
 - 入口：`unirae/train_dino_rae_stage1.py`
 - 目标：在 `unirae_radio` 内复用 RAE 全量 Stage-1 逻辑（不是单独跑 RAE 仓库）
   - 训练：`L1 + LPIPS + GAN + adaptive d_weight + DiffAug + EMA + cosine`
@@ -228,12 +239,12 @@ python -m accelerate.commands.launch --num_processes 8 --num_machines 1 -m unira
 
 8 卡直跑（HF `load_from_disk`）：
 ```bash
-cd /project/peilab/luxiaocheng/projects/unirae_radio
+cd /project/peilab/luxiaocheng/projects/DSGA
 
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 python -m accelerate.commands.launch --num_processes 8 --num_machines 1 -m unirae.train_dino_rae_stage1 \
   --config configs/imagenet_dino_rae_stage1_full.yaml \
-  --run_name uniradio_rae_stage1_full_s42 \
+  --run_name dsga_rae_stage1_full_s42 \
   --set data.data_format=hf_disk \
   --set data.hf_load_from_disk=/path/to/imagenet_hf_saved \
   --set data.hf_split_train=train \
@@ -247,3 +258,74 @@ python -m accelerate.commands.launch --num_processes 8 --num_machines 1 -m unira
 日志会打印：
 - 训练：`total_loss/recon_l1/lpips/gan_g/disc_loss/disc_acc/mse/psnr`
 - 评估：`[eval][step=...]`（官方 eval 开启时输出 `psnr/ssim/rfid`）
+
+## 14) 官方 RAE 预训练 Decoder 初始化校验（看初始 rMSE）
+- 新脚本：`unirae/eval_rae_official_init.py`
+- 目的：确认官方 decoder 权重加载正确，并用同一数据对比
+  - `official_pretrained`（加载官方 ckpt）
+  - `random_decoder`（不加载 decoder ckpt）
+- 输出：`mse / rmse / psnr`
+
+先下载官方权重到本地 RAE 目录（只需一次）：
+```bash
+cd /project/peilab/luxiaocheng/projects/RAE
+hf download nyu-visionx/RAE-collections \
+  decoders/dinov2/wReg_base/ViTXL_n08/model.pt \
+  stats/dinov2/wReg_base/imagenet1k/stat.pt \
+  discs/dino_vit_small_patch8_224.pth \
+  --repo-type model \
+  --local-dir models
+```
+
+HF `load_from_disk` 完整校验命令（推荐）：
+```bash
+cd /project/peilab/luxiaocheng/projects/DSGA
+
+python -m unirae.eval_rae_official_init \
+  --dataset_mode imagenet \
+  --data_root /path/to/imagenet_hf_saved \
+  --data_format hf_disk \
+  --hf_load_from_disk /path/to/imagenet_hf_saved \
+  --hf_split_override validation \
+  --image_size 256 \
+  --batch_size 32 \
+  --num_workers 8 \
+  --max_batches 50 \
+  --device cuda \
+  --compare_random_decoder \
+  --out_json results/rae_official_init_cmp.json
+```
+
+如果加载正确，通常会看到：
+- `official_pretrained.rmse` 显著低于 `random_decoder.rmse`
+- `official_pretrained.psnr` 显著高于 `random_decoder.psnr`
+
+## 15) ImageNet-100 Early Gradient Dynamics（Bridge Experiment）
+- 新脚本：`unirae/train_imagenet100_dynamics.py`
+- 目标：在前 1000 step 内高频记录 encoder 各层 `g_u`(CE) 与 `g_g`(MSE) 冲突
+  - `step<=1000` 且 `step%50==0` 触发探针
+  - 每次输出：`results/in100_grad_dynamics_{init_mode}/step_XXXX.csv`
+- 初始化对照：
+  - `--encoder_init scratch`：`vit_small_patch14_dinov2` 架构随机初始化
+  - `--encoder_init dinov2`：同架构加载 DINOv2 预训练权重
+
+单组启动示例：
+```bash
+cd /project/peilab/luxiaocheng/projects/DSGA
+
+python -m unirae.train_imagenet100_dynamics \
+  --encoder_init scratch \
+  --hf_dataset_id clane9/imagenet-100 \
+  --batch_size 128 \
+  --num_workers 8 \
+  --max_steps 1200 \
+  --probe_until 1000 \
+  --probe_every 50 \
+  --output_root results
+```
+
+一键顺序跑 `scratch -> dinov2`：
+```bash
+cd /project/peilab/luxiaocheng/projects/DSGA
+bash run_imagenet100_dynamics.sh
+```

@@ -1,4 +1,4 @@
-"""UniRAE RADIO training and analysis package."""
+"""DSGA training and analysis package."""
 
 __all__ = [
     "data_imagenet",
@@ -12,6 +12,7 @@ __all__ = [
     "eval_understanding",
     "eval_generation",
     "eval_radio_repr",
+    "dsga_pipeline",
     "train",
     "analyze_tradeoff",
     "utils",

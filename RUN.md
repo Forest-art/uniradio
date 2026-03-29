@@ -25,7 +25,7 @@
 
 ### 2.1 Create venv
 ```bash
-cd /project/peilab/luxiaocheng/projects/unirae_radio
+cd /project/peilab/luxiaocheng/projects/DSGA
 python3.10 -m venv .venv
 source .venv/bin/activate
 python -m pip install -U pip setuptools wheel
@@ -51,6 +51,14 @@ print("timm:", timm.__version__)
 PY
 ```
 
+`rFID` 依赖自检（建议也跑一下）：
+```bash
+python - <<'PY'
+import torch_fidelity
+print("torch_fidelity:", torch_fidelity.__version__)
+PY
+```
+
 ---
 
 ## 3. Data Source
@@ -68,7 +76,7 @@ PY
 
 默认 seed=42，按顺序跑 `scratch -> dinov2`：
 ```bash
-cd /project/peilab/luxiaocheng/projects/unirae_radio
+cd /project/peilab/luxiaocheng/projects/DSGA
 source .venv/bin/activate
 
 bash run_imagenet100_dynamics.sh
@@ -90,6 +98,8 @@ bash run_imagenet100_dynamics.sh
 HF_DATASET_ID=clane9/imagenet-100 \
 ENCODER_CKPT=/path/to/your/dino_local.pth \
 BATCH_SIZE=32 \
+LAMBDA_U=1.0 \
+LAMBDA_G=100.0 \
 NUM_WORKERS=8 \
 MAX_STEPS=1000 \
 PROBE_UNTIL=1000 \
@@ -110,6 +120,13 @@ bash run_imagenet100_dynamics.sh
 - 单卡（`NUM_GPUS=1`）：`BATCH_SIZE` 就是总 batch size。
 - 多卡（`NUM_GPUS>1`）：`BATCH_SIZE` 是每卡 local batch size，总 batch size = `BATCH_SIZE * NUM_GPUS`。
 
+Loss 权重默认值（见 `run_imagenet100_dynamics.sh`）：
+
+- `LAMBDA_U=1.0`
+- `LAMBDA_G=100.0`
+
+用于缓解 `loss_u` 与 `loss_g` 量纲差异过大导致的优化偏置。
+
 ---
 
 ## 5. Multi-GPU Run
@@ -118,11 +135,13 @@ bash run_imagenet100_dynamics.sh
 
 示例（8 卡）：
 ```bash
-cd /project/peilab/luxiaocheng/projects/unirae_radio
+cd /project/peilab/luxiaocheng/projects/DSGA
 source .venv/bin/activate
 
 NUM_GPUS=8 \
 BATCH_SIZE=32 \
+LAMBDA_U=1.0 \
+LAMBDA_G=100.0 \
 NUM_WORKERS=8 \
 MAX_STEPS=1000 \
 PROBE_UNTIL=1000 \
@@ -149,12 +168,14 @@ MASTER_PORT=29601 NUM_GPUS=8 bash run_imagenet100_dynamics.sh
 
 建议 3 seeds: `42,43,44`
 ```bash
-cd /project/peilab/luxiaocheng/projects/unirae_radio
+cd /project/peilab/luxiaocheng/projects/DSGA
 source .venv/bin/activate
 
 for seed in 42 43 44; do
   HF_DATASET_ID=clane9/imagenet-100 \
   BATCH_SIZE=32 \
+  LAMBDA_U=1.0 \
+  LAMBDA_G=100.0 \
   NUM_WORKERS=8 \
   MAX_STEPS=1000 \
   PROBE_UNTIL=1000 \
@@ -176,7 +197,7 @@ done
 ## 7. Plot Publication-Style Figures
 
 ```bash
-cd /project/peilab/luxiaocheng/projects/unirae_radio
+cd /project/peilab/luxiaocheng/projects/DSGA
 source .venv/bin/activate
 
 python -m unirae.plot_imagenet100_dynamics_pub \
@@ -251,4 +272,10 @@ export EVAL_RFID_TMP_DIR=/tmp
 可以减小 `EVAL_RFID_NUM_SAMPLES`（例如 `256`），或临时关闭：
 ```bash
 SKIP_RFID=1 bash run_imagenet100_dynamics.sh
+```
+
+### 10.5 rFID 是 NaN（缺依赖）
+如果 `eval_metrics.jsonl` 里出现 `\"rfid_error\": \"No module named 'torch_fidelity'\"`，安装：
+```bash
+pip install -U torch-fidelity
 ```

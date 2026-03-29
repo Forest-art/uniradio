@@ -1,0 +1,74 @@
+seed: 42
+
+experiment:
+  name: sun397_dino_joint_base
+  group: sun397_dino_joint
+
+output:
+  root: runs
+
+data:
+  dataset: sun397
+  root: /project/peilab/luxiaocheng/projects/DSGA/data/sun397
+  image_size: 224
+  batch_size: 32
+  num_workers: 8
+  download: false
+  val_from_train: false
+  val_ratio: 0.1
+  use_fake_data: false
+  fake_train_size: 4096
+  fake_eval_size: 1024
+  sun_source: hf
+  sun_hf_dataset: dpdl-benchmark/sun397
+  sun_hf_cache_dir: /project/peilab/luxiaocheng/projects/DSGA/data/sun397/hf_cache
+  sun_hf_image_key: image
+  sun_hf_label_key: label
+  sun_max_train_samples: 0
+  sun_max_eval_samples: 0
+
+model:
+  backbone: dinov2_vits14
+  pretrained: true
+  freeze_backbone: false
+  txt_dim: 256
+  rec_dim: 256
+  decoder_hidden_dim: 1024
+  recon_size: 64
+
+text:
+  prompt_templates:
+    - "a photo of a {class}"
+  temperature: 0.07
+
+train:
+  mode: joint
+  steps: 5000
+  lambda_txt: 1.0
+  lambda_rec: 1.0
+  grad_strategy: cagrad
+  cagrad_beta: 0.35
+  shared_params: backbone
+  grad_norm_mode: mean
+  grad_norm_scope: conflict_all
+  grad_norm_layers: layer3+layer4
+
+optim:
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+
+log:
+  every: 20
+  cos_every: 20
+  save_every: 1000
+  eval_every: 1000
+
+eval:
+  split: test
+  batch_size: 128
+  max_batches: 40
+  save_recon_samples: true
+  sample_images: 8
+
+accelerate:
+  mixed_precision: "no"

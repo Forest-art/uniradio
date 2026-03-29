@@ -1,6 +1,8 @@
 import argparse
 import csv
+import math
 import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -19,10 +21,12 @@ from .data_cifar10 import (
     make_batch_dict,
 )
 from .grad_conflict import (
+    _symmetric_balance_scales,
     apply_naive,
     apply_cagrad,
     apply_saop,
     apply_laga_objective,
+    apply_ma_laga,
     apply_ma_laga_objective,
     apply_conflict_aware,
     compute_grad_cosine,
@@ -213,6 +217,30 @@ def _pearson_corr(xs: List[float], ys: List[float], eps: float = 1e-12) -> float
         return 0.0
     cov = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
     return float(cov / ((vx * vy) ** 0.5 + eps))
+
+
+def _canonicalize_preserve_target(raw, key: str) -> str:
+    target = str(raw).strip().lower()
+    aliases = {
+        "u": "understanding",
+        "txt": "understanding",
+        "text": "understanding",
+        "understanding": "understanding",
+        "g": "generation",
+        "gen": "generation",
+        "rec": "generation",
+        "recon": "generation",
+        "reconstruction": "generation",
+        "generation": "generation",
+        "sym": "symmetric",
+        "symmetric": "symmetric",
+        "neutral": "symmetric",
+        "none": "symmetric",
+        "neither": "symmetric",
+    }
+    if target not in aliases:
+        raise ValueError(f"Unsupported {key}={raw}. Use understanding|generation|symmetric.")
+    return aliases[target]
 
 
 def _rank_values(values: List[float]) -> List[float]:
@@ -425,6 +453,298 @@ def _save_layer_probe_csv(path: str, rows: List[Dict[str, float]]) -> None:
             writer.writerow(row)
 
 
+def _compute_dsga_probe_rows(
+    step: int,
+    g_u: List[torch.Tensor],
+    g_g: List[torch.Tensor],
+    group_to_indices: Dict[str, List[int]],
+    group_to_depth: Dict[str, int],
+    ordered_groups: List[str],
+    align_gamma: float,
+    mode: str,
+    conflict_threshold: float,
+    conflict_only: bool,
+    norm_restore: bool,
+    eps: float,
+    magnitude_scope: str,
+    adaptive_layerwise_blend: bool,
+    adaptive_blend_strength: float,
+    adaptive_blend_power: float,
+    preserve_target: str,
+) -> Tuple[List[Dict[str, float]], Dict[str, float]]:
+    rows: List[Dict[str, float]] = []
+    norm_ratios: List[float] = []
+    mt_values: List[float] = []
+    alpha_post_conflict: List[float] = []
+    adaptive_weights: List[float] = []
+
+    mode = str(mode).lower()
+    magnitude_scope = str(magnitude_scope).lower()
+    eps = float(max(1e-12, eps))
+    preserve_target = _canonicalize_preserve_target(preserve_target, key="probe.preserve_target")
+    if preserve_target == "generation":
+        g_u, g_g = g_g, g_u
+
+    global_scale = 1.0
+    gu_all = torch.cat([g.detach().reshape(-1) for g in g_u], dim=0)
+    gg_all = torch.cat([g.detach().reshape(-1) for g in g_g], dim=0)
+    nu_all = torch.linalg.norm(gu_all)
+    ng_all = torch.linalg.norm(gg_all)
+    global_cos = float(torch.dot(gu_all, gg_all).item() / (nu_all.item() * ng_all.item() + eps)) if float(nu_all.item()) > eps and float(ng_all.item()) > eps else 0.0
+    total_energy = float(nu_all.item() + ng_all.item())
+    if magnitude_scope == "global" and mode not in {"direction_only", "nr_laga"}:
+        if preserve_target == "symmetric":
+            global_scale_u, global_scale_g = _symmetric_balance_scales(nu_all, ng_all, align_gamma, eps=eps)
+        else:
+            global_scale = float(torch.pow((nu_all / (ng_all + eps)).clamp_min(eps), float(max(0.0, align_gamma))).item())
+            global_scale_u = None
+            global_scale_g = None
+    else:
+        global_scale_u = None
+        global_scale_g = None
+
+    merged_global = None
+    merged_local = None
+    adaptive_layerwise_blend = bool(adaptive_layerwise_blend)
+    adaptive_blend_strength = float(max(0.0, adaptive_blend_strength))
+    adaptive_blend_power = float(max(1e-6, adaptive_blend_power))
+    if adaptive_layerwise_blend and len(group_to_indices) > 1:
+        all_indices = {"all": list(range(len(g_u)))}
+        merged_global = apply_ma_laga(
+            grads_u=g_u,
+            grads_g=g_g,
+            layers=all_indices,
+            preserve_target=preserve_target,
+            align_gamma=align_gamma,
+            norm_restore=norm_restore,
+            mode=mode,
+            conflict_threshold=conflict_threshold,
+            conflict_only=conflict_only,
+            eps=eps,
+            magnitude_scope="global",
+            adaptive_layerwise_blend=False,
+            adaptive_blend_strength=adaptive_blend_strength,
+            adaptive_blend_power=adaptive_blend_power,
+        )
+        merged_local = apply_ma_laga(
+            grads_u=g_u,
+            grads_g=g_g,
+            layers=group_to_indices,
+            preserve_target=preserve_target,
+            align_gamma=align_gamma,
+            norm_restore=norm_restore,
+            mode=mode,
+            conflict_threshold=conflict_threshold,
+            conflict_only=conflict_only,
+            eps=eps,
+            magnitude_scope=magnitude_scope,
+            adaptive_layerwise_blend=False,
+            adaptive_blend_strength=adaptive_blend_strength,
+            adaptive_blend_power=adaptive_blend_power,
+        )
+
+    for gname in ordered_groups:
+        indices = group_to_indices.get(gname, [])
+        if len(indices) == 0:
+            continue
+        gu_flat = torch.cat([g_u[i].detach().reshape(-1) for i in indices], dim=0)
+        gg_flat = torch.cat([g_g[i].detach().reshape(-1) for i in indices], dim=0)
+        gu_norm = torch.linalg.norm(gu_flat)
+        gg_norm = torch.linalg.norm(gg_flat)
+        dot_ug = torch.dot(gu_flat, gg_flat)
+        cos = float(dot_ug.item() / (gu_norm.item() * gg_norm.item() + eps)) if float(gu_norm.item()) > eps and float(gg_norm.item()) > eps else 0.0
+        neg = _neg_ratio_flat(gu_flat, gg_flat)
+        alpha_pre = float(dot_ug.item() / (torch.dot(gu_flat, gu_flat).item() + eps))
+        is_conflict = cos < float(conflict_threshold)
+
+        mt = 1.0
+        projection_applied = 0
+        if preserve_target == "symmetric" and mode == "direction_only":
+            gu_eff = gu_flat
+            gg_eff = gg_flat
+            if is_conflict:
+                proj_u = dot_ug / (torch.dot(gg_flat, gg_flat) + eps)
+                proj_g = dot_ug / (torch.dot(gu_flat, gu_flat) + eps)
+                gu_eff = gu_flat - proj_u * gg_flat
+                gg_eff = gg_flat - proj_g * gu_flat
+                projection_applied = 1
+            g_star = gu_eff + gg_eff
+        elif mode == "direction_only":
+            gg_eff = gg_flat
+            if is_conflict:
+                proj_coeff = dot_ug / (torch.dot(gu_flat, gu_flat) + eps)
+                gg_eff = gg_flat - proj_coeff * gu_flat
+                projection_applied = 1
+            g_star = gu_flat + gg_eff
+        else:
+            if preserve_target == "symmetric":
+                if magnitude_scope == "global":
+                    mt_u = float(global_scale_u.item()) if global_scale_u is not None else 1.0
+                    mt_g = float(global_scale_g.item()) if global_scale_g is not None else 1.0
+                else:
+                    su, sg = _symmetric_balance_scales(gu_norm, gg_norm, align_gamma, eps=eps)
+                    mt_u = float(su.item())
+                    mt_g = float(sg.item())
+                gu_aligned = mt_u * gu_flat
+                gg_aligned = mt_g * gg_flat
+                mt = float(0.5 * (mt_u + mt_g))
+                gu_eff = gu_aligned
+                gg_eff = gg_aligned
+                if mode == "magnitude_only":
+                    if conflict_only and (not is_conflict):
+                        gu_eff = gu_flat
+                        gg_eff = gg_flat
+                        mt = 1.0
+                else:
+                    if is_conflict:
+                        proj_u = torch.dot(gu_aligned, gg_aligned) / (torch.dot(gg_aligned, gg_aligned) + eps)
+                        proj_g = torch.dot(gu_aligned, gg_aligned) / (torch.dot(gu_aligned, gu_aligned) + eps)
+                        gu_eff = gu_aligned - proj_u * gg_aligned
+                        gg_eff = gg_aligned - proj_g * gu_aligned
+                        projection_applied = 1
+                        if norm_restore:
+                            restore_u = torch.linalg.norm(gu_aligned) / (torch.linalg.norm(gu_eff) + eps)
+                            restore_g = torch.linalg.norm(gg_aligned) / (torch.linalg.norm(gg_eff) + eps)
+                            gu_eff = restore_u * gu_eff
+                            gg_eff = restore_g * gg_eff
+                    elif conflict_only:
+                        gu_eff = gu_flat
+                        gg_eff = gg_flat
+                        mt = 1.0
+                g_star = gu_eff + gg_eff
+            else:
+                if magnitude_scope == "global":
+                    mt = float(global_scale)
+                else:
+                    mt = float(torch.pow((gu_norm / (gg_norm + eps)).clamp_min(eps), float(max(0.0, align_gamma))).item())
+                gg_aligned = mt * gg_flat
+                gg_eff = gg_aligned
+                if mode == "magnitude_only":
+                    if conflict_only and (not is_conflict):
+                        gg_eff = gg_flat
+                        mt = 1.0
+                else:
+                    if is_conflict:
+                        proj_coeff = torch.dot(gg_aligned, gu_flat) / (torch.dot(gu_flat, gu_flat) + eps)
+                        gg_eff = gg_aligned - proj_coeff * gu_flat
+                        projection_applied = 1
+                        if norm_restore:
+                            norm_aligned = torch.linalg.norm(gg_aligned)
+                            norm_eff = torch.linalg.norm(gg_eff)
+                            restore_scale = norm_aligned / (norm_eff + eps)
+                            gg_eff = restore_scale * gg_eff
+                    elif conflict_only:
+                        gg_eff = gg_flat
+                        mt = 1.0
+                g_star = gu_flat + gg_eff
+
+        alpha_post = float(torch.dot(gg_eff, gu_flat).item() / (torch.dot(gu_flat, gu_flat).item() + eps))
+        raw_sum = gu_flat + gg_flat
+        raw_norm = float(torch.linalg.norm(raw_sum).item())
+        g_star_norm = float(torch.linalg.norm(g_star).item())
+        norm_ratio = float(g_star_norm / max(raw_norm, eps))
+        adaptive_weight = 0.0
+
+        if merged_global is not None and merged_local is not None:
+            conflict_gain = max(0.0, 0.5 * (global_cos - cos))
+            local_energy = float(gu_norm.item() + gg_norm.item())
+            energy_share = local_energy / max(total_energy, eps)
+            adaptive_weight = adaptive_blend_strength * conflict_gain * (energy_share ** adaptive_blend_power)
+            adaptive_weight = float(min(max(adaptive_weight, 0.0), 1.0))
+            gstar_global = torch.cat([merged_global[i].detach().reshape(-1) for i in indices], dim=0)
+            gstar_local = torch.cat([merged_local[i].detach().reshape(-1) for i in indices], dim=0)
+            g_star = (1.0 - adaptive_weight) * gstar_global + adaptive_weight * gstar_local
+            gg_eff = g_star - gu_flat
+            alpha_post = float(torch.dot(gg_eff, gu_flat).item() / (torch.dot(gu_flat, gu_flat).item() + eps))
+            g_star_norm = float(torch.linalg.norm(g_star).item())
+            norm_ratio = float(g_star_norm / max(raw_norm, eps))
+            if float(gg_norm.item()) > eps:
+                mt = float(torch.linalg.norm(gg_eff).item() / max(float(gg_norm.item()), eps))
+            projection_applied = int(adaptive_weight > 0.0 and is_conflict)
+
+        rows.append(
+            {
+                "step": int(step),
+                "layer": gname,
+                "depth": int(group_to_depth[gname]),
+                "cosine_similarity": float(cos),
+                "neg_ratio": float(neg),
+                "norm_ratio": float(norm_ratio),
+                "alpha_pre": float(alpha_pre),
+                "alpha_post": float(alpha_post),
+                "mt_scale": float(mt),
+                "adaptive_weight": float(adaptive_weight),
+                "clipped_flag": 0,
+                "projection_applied": int(projection_applied),
+                "conflict_flag": int(is_conflict),
+                "gu_norm": float(gu_norm.item()),
+                "gg_norm": float(gg_norm.item()),
+                "gstar_norm": float(g_star_norm),
+                "raw_sum_norm": float(raw_norm),
+                "numel": int(gu_flat.numel()),
+            }
+        )
+        norm_ratios.append(float(norm_ratio))
+        mt_values.append(float(mt))
+        adaptive_weights.append(float(adaptive_weight))
+        if projection_applied:
+            alpha_post_conflict.append(abs(float(alpha_post)))
+
+    stats = {
+        "step": int(step),
+        "num_layers": int(len(rows)),
+        "mean_norm_ratio": float(sum(norm_ratios) / max(1, len(norm_ratios))),
+        "mean_mt": float(sum(mt_values) / max(1, len(mt_values))),
+        "mean_abs_alpha_post_conflict": float(sum(alpha_post_conflict) / max(1, len(alpha_post_conflict))),
+        "mean_adaptive_weight": float(sum(adaptive_weights) / max(1, len(adaptive_weights))),
+        "num_projected": int(sum(int(r["projection_applied"]) for r in rows)),
+        "conflict_fraction": float(sum(int(r["conflict_flag"]) for r in rows) / max(1, len(rows))),
+        "global_mt": float(
+            0.5 * (
+                float(global_scale_u.item()) if global_scale_u is not None else 1.0
+            ) + 0.5 * (
+                float(global_scale_g.item()) if global_scale_g is not None else 1.0
+            )
+            if preserve_target == "symmetric" and magnitude_scope == "global" and mode not in {"direction_only", "nr_laga"}
+            else (global_scale if magnitude_scope == "global" and mode not in {"direction_only", "nr_laga"} else 1.0)
+        ),
+    }
+    return rows, stats
+
+
+def _save_dsga_probe_csv(path: str, rows: List[Dict[str, float]]) -> None:
+    ensure_dir(str(Path(path).parent))
+    if len(rows) == 0:
+        return
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "step",
+                "layer",
+                "depth",
+                "cosine_similarity",
+                "neg_ratio",
+                "norm_ratio",
+                "alpha_pre",
+                "alpha_post",
+                "mt_scale",
+                "adaptive_weight",
+                "clipped_flag",
+                "projection_applied",
+                "conflict_flag",
+                "gu_norm",
+                "gg_norm",
+                "gstar_norm",
+                "raw_sum_norm",
+                "numel",
+            ],
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
 def evaluate_understanding(
     model: CifarTradeoffModel,
     loader,
@@ -481,12 +801,32 @@ def evaluate_generation(
     sample_path: str,
     save_samples: bool,
     sample_images: int,
+    loss_kind: str = "mse",
+    loss_eps: float = 1e-8,
+    compute_rfid: bool = False,
+    rfid_num_samples: int = 0,
+    rfid_batch_size: int = 64,
+    rfid_tmp_dir: str = "",
 ) -> Dict[str, float]:
     model.eval()
 
     total_mse = 0.0
     n = 0
     saved = False
+    rfid_saved = 0
+    rfid = float("nan")
+    rfid_error = ""
+    tmp_root = None
+    real_dir = None
+    fake_dir = None
+    if compute_rfid and int(rfid_num_samples) > 1:
+        tmp_parent = rfid_tmp_dir if str(rfid_tmp_dir).strip() else str(Path(sample_path).resolve().parent / "_rfid_tmp")
+        ensure_dir(tmp_parent)
+        tmp_root = tempfile.TemporaryDirectory(prefix="cifar_rfid_", dir=tmp_parent)
+        real_dir = Path(tmp_root.name) / "real"
+        fake_dir = Path(tmp_root.name) / "fake"
+        real_dir.mkdir(parents=True, exist_ok=True)
+        fake_dir.mkdir(parents=True, exist_ok=True)
 
     with torch.no_grad():
         for bi, batch in enumerate(loader):
@@ -515,15 +855,60 @@ def evaluate_generation(
                 )
                 saved = True
 
+            if compute_rfid and real_dir is not None and fake_dir is not None and rfid_saved < int(rfid_num_samples):
+                gt = torch.clamp(denormalize_cifar10(batch["images"], dataset=dataset_name).cpu(), 0.0, 1.0)
+                rc = torch.clamp(denormalize_cifar10(recon, dataset=dataset_name).cpu(), 0.0, 1.0)
+                if rc.shape[-2:] != gt.shape[-2:]:
+                    rc = F.interpolate(rc, size=gt.shape[-2:], mode="bilinear", align_corners=False)
+                for i in range(gt.shape[0]):
+                    if rfid_saved >= int(rfid_num_samples):
+                        break
+                    save_image(gt[i], str(real_dir / f"{rfid_saved:07d}.png"))
+                    save_image(rc[i], str(fake_dir / f"{rfid_saved:07d}.png"))
+                    rfid_saved += 1
+
     recon_mse = total_mse / max(n, 1)
+    recon_rmse = float((recon_mse + loss_eps) ** 0.5)
+    eval_loss = recon_rmse if loss_kind == "rmse" else recon_mse
     psnr = -10.0 * torch.log10(torch.tensor(recon_mse + 1e-8)).item()
+
+    if compute_rfid and real_dir is not None and fake_dir is not None and rfid_saved > 1:
+        try:
+            from torch_fidelity import calculate_metrics
+
+            ret = calculate_metrics(
+                input1=str(real_dir),
+                input2=str(fake_dir),
+                cuda=(device.type == "cuda"),
+                isc=False,
+                fid=True,
+                kid=False,
+                prc=False,
+                verbose=False,
+                batch_size=int(rfid_batch_size),
+            )
+            rfid = float(ret.get("frechet_inception_distance", float("nan")))
+        except Exception as e:  # noqa: BLE001
+            rfid_error = str(e)
+            if isinstance(e, ModuleNotFoundError) and "torch_fidelity" in str(e):
+                rfid_error = f"{rfid_error}; install with: pip install torch-fidelity"
+
+    if tmp_root is not None:
+        tmp_root.cleanup()
+
     return {
         "recon_mode": "pixel_recon",
-        "loss": recon_mse,
+        "loss_kind": loss_kind,
+        "loss": eval_loss,
         "recon_mse": recon_mse,
+        "recon_rmse": recon_rmse,
         "mse": recon_mse,
+        "rmse": recon_rmse,
         "psnr": psnr,
         "num_batches": n,
+        "rfid": None if math.isnan(rfid) else float(rfid),
+        "rfid_num_samples": int(rfid_saved),
+        "rfid_error": rfid_error,
     }
 
 
@@ -538,7 +923,12 @@ def run_eval(
     dataset_name: str,
 ) -> None:
     eval_cfg = cfg.get("eval", {})
+    train_cfg = cfg.get("train", {})
     max_batches = eval_cfg.get("max_batches", None)
+    recon_loss_kind = str(train_cfg.get("recon_loss", "mse")).lower()
+    if recon_loss_kind not in {"mse", "rmse"}:
+        recon_loss_kind = "mse"
+    recon_loss_eps = float(train_cfg.get("recon_loss_eps", 1e-8))
 
     understanding = evaluate_understanding(
         model=model,
@@ -558,6 +948,12 @@ def run_eval(
         sample_path=os.path.join(run_dir, "samples", f"step_{step:07d}.png"),
         save_samples=bool(eval_cfg.get("save_recon_samples", True)),
         sample_images=int(eval_cfg.get("sample_images", 8)),
+        loss_kind=recon_loss_kind,
+        loss_eps=recon_loss_eps,
+        compute_rfid=bool(eval_cfg.get("compute_rfid", False)),
+        rfid_num_samples=int(eval_cfg.get("rfid_num_samples", 0)),
+        rfid_batch_size=int(eval_cfg.get("rfid_batch_size", 64)),
+        rfid_tmp_dir=str(eval_cfg.get("rfid_tmp_dir", os.path.join(run_dir, "_rfid_tmp"))),
     )
 
     save_json(understanding, os.path.join(run_dir, "understanding.json"))
@@ -573,14 +969,16 @@ def _resolve_training_mode(cfg: Dict) -> Tuple[str, int, float, float, str]:
     lambda_txt = float(train_cfg.get("lambda_txt", 1.0))
     lambda_rec = float(train_cfg.get("lambda_rec", 1.0))
     strategy = str(train_cfg.get("grad_strategy", train_cfg.get("strategy", "naive"))).lower()
+    if strategy == "ma-laga":
+        strategy = "ma_laga"
 
     if mode == "joint":
         if strategy == "conflict_aware":
             strategy = "pcgrad"
-        if strategy not in {"naive", "pcgrad", "cagrad", "saop", "laga", "ma_laga"}:
+        if strategy not in {"naive", "pcgrad", "cagrad", "saop", "laga", "ma_laga", "dsga"}:
             raise ValueError(
                 f"Unsupported train.strategy={strategy}. "
-                "Only naive|pcgrad|cagrad|saop|laga|ma_laga are allowed for joint mode."
+                "Only naive|pcgrad|cagrad|saop|laga|ma_laga|dsga are allowed for joint mode."
             )
         return mode, steps, lambda_txt, lambda_rec, strategy
     if mode == "text_only":
@@ -591,6 +989,28 @@ def _resolve_training_mode(cfg: Dict) -> Tuple[str, int, float, float, str]:
         f"Unsupported train.mode={mode}. "
         "Only joint|text_only|recon_only are supported."
     )
+
+
+def _resolve_recon_loss(cfg: Dict) -> Tuple[str, float]:
+    train_cfg = cfg.get("train", {})
+    raw_kind = str(train_cfg.get("recon_loss", "mse")).lower()
+    alias = {
+        "l2": "mse",
+        "root_mse": "rmse",
+        "r_mse": "rmse",
+        "rms": "rmse",
+    }
+    kind = alias.get(raw_kind, raw_kind)
+    if kind not in {"mse", "rmse"}:
+        raise ValueError(
+            f"Unsupported train.recon_loss={raw_kind}. Use one of: mse|rmse."
+        )
+    eps = float(train_cfg.get("recon_loss_eps", 1e-8))
+    if eps <= 0.0:
+        raise ValueError(
+            f"Unsupported train.recon_loss_eps={eps}. Must be > 0."
+        )
+    return kind, eps
 
 
 def _resolve_grad_norm_mode(cfg: Dict, mode: str) -> str:
@@ -804,14 +1224,36 @@ def _resolve_saop_plan(
 
 
 def _resolve_laga_plan(
+    cfg: Dict,
     mode: str,
     strategy: str,
     model: CifarTradeoffModel,
     shared_params: List[nn.Parameter],
     shared_mode: str,
 ) -> Dict[str, List[int]]:
-    if mode != "joint" or strategy not in {"laga", "ma_laga"} or len(shared_params) == 0:
+    if mode != "joint" or strategy not in {"laga", "ma_laga", "dsga"} or len(shared_params) == 0:
         return {}
+
+    train_cfg = cfg.get("train", {})
+    laga_grouping = str(train_cfg.get("laga_grouping", "layerwise")).lower()
+    if laga_grouping in {"global", "all", "single"}:
+        # Global decomposition: treat all shared parameters as one group.
+        return {"global": list(range(len(shared_params)))}
+    if laga_grouping in {"deep"}:
+        layers = _parse_grad_norm_layers(train_cfg.get("laga_layers", ["layer3", "layer4"]))
+        layer_set = set(layers)
+        names = _build_shared_param_names(model=model, shared_params=shared_params, shared_mode=shared_mode)
+        groups: Dict[str, List[int]] = {}
+        for i, n in enumerate(names):
+            tag = _layer_tag_from_param_name(n)
+            if tag in layer_set:
+                groups.setdefault(tag, []).append(i)
+        return groups
+    if laga_grouping not in {"layerwise", "layer"}:
+        raise ValueError(
+            f"Unsupported train.laga_grouping={laga_grouping}. "
+            "Use one of: layerwise|deep|global."
+        )
 
     # Fixed 5 groups for fair protocol: stem + layer1..layer4.
     ordered_groups = ["stem", "layer1", "layer2", "layer3", "layer4"]
@@ -971,11 +1413,19 @@ def main() -> None:
     if len(all_trainable) == 0:
         raise RuntimeError("No trainable parameters in model.")
 
+    base_lr = float(cfg.get("optim", {}).get("lr", 3e-4))
+    warmup_steps = int(cfg.get("optim", {}).get("warmup_steps", 0))
+    if warmup_steps < 0:
+        raise ValueError("optim.warmup_steps must be >= 0")
+
     optimizer = torch.optim.AdamW(
         all_trainable,
-        lr=float(cfg.get("optim", {}).get("lr", 3e-4)),
+        lr=base_lr,
         weight_decay=float(cfg.get("optim", {}).get("weight_decay", 1e-4)),
     )
+    if warmup_steps > 0:
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = 0.0
 
     model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
 
@@ -983,6 +1433,7 @@ def main() -> None:
     grad_norm_mode = _resolve_grad_norm_mode(cfg, mode=mode)
     train_cfg = cfg.get("train", {})
     cagrad_beta = float(cfg.get("train", {}).get("cagrad_beta", 0.5))
+    recon_loss_kind, recon_loss_eps = _resolve_recon_loss(cfg)
     cagrad_conflict_only_raw = train_cfg.get("cagrad_conflict_only", False)
     if isinstance(cagrad_conflict_only_raw, bool):
         cagrad_conflict_only = cagrad_conflict_only_raw
@@ -1057,6 +1508,7 @@ def main() -> None:
         shared_mode=shared_mode,
     )
     laga_groups = _resolve_laga_plan(
+        cfg=cfg,
         mode=mode,
         strategy=strategy,
         model=model,
@@ -1097,21 +1549,75 @@ def main() -> None:
         raise ValueError(
             "Unsupported LAGA alpha range: train.laga_alpha_max must be >= train.laga_alpha_min."
         )
-    ma_laga_align_gamma = float(train_cfg.get("ma_laga_align_gamma", 0.5))
-    if ma_laga_align_gamma < 0.0:
+    laga_preserve_target = _canonicalize_preserve_target(
+        train_cfg.get("laga_preserve_target", "understanding"),
+        key="train.laga_preserve_target",
+    )
+    # DSGA naming:
+    #   - DSGA-M: magnitude alignment knobs (dsga_m_*)
+    #   - DSGA-D: directional decomposition mode (dsga_d_mode)
+    # Legacy ma_laga_* keys are kept as fallback for compatibility.
+    dsga_m_align_gamma = float(train_cfg.get("dsga_m_align_gamma", train_cfg.get("ma_laga_align_gamma", 0.5)))
+    if dsga_m_align_gamma < 0.0:
         raise ValueError(
-            f"Unsupported train.ma_laga_align_gamma={ma_laga_align_gamma}. Must be >= 0."
+            f"Unsupported train.dsga_m_align_gamma={dsga_m_align_gamma}. Must be >= 0."
         )
-    ma_laga_norm_restore_raw = train_cfg.get("ma_laga_norm_restore", True)
-    if isinstance(ma_laga_norm_restore_raw, bool):
-        ma_laga_norm_restore = ma_laga_norm_restore_raw
+    dsga_m_scope = str(train_cfg.get("dsga_m_scope", train_cfg.get("ma_laga_m_scope", "global"))).lower()
+    if dsga_m_scope not in {"layerwise", "global"}:
+        raise ValueError(
+            f"Unsupported train.dsga_m_scope={dsga_m_scope}. "
+            "Use one of: layerwise|global."
+        )
+    dsga_d_mode = str(train_cfg.get("dsga_d_mode", train_cfg.get("ma_laga_mode", "full"))).lower()
+    if dsga_d_mode not in {"full", "direction_only", "magnitude_only"}:
+        raise ValueError(
+            f"Unsupported train.dsga_d_mode={dsga_d_mode}. "
+            "Use one of: full|direction_only|magnitude_only."
+        )
+    dsga_d_conflict_threshold = float(
+        train_cfg.get("dsga_d_conflict_threshold", train_cfg.get("ma_laga_conflict_threshold", 0.0))
+    )
+    if not (-1.0 <= dsga_d_conflict_threshold <= 1.0):
+        raise ValueError(
+            f"Unsupported train.dsga_d_conflict_threshold={dsga_d_conflict_threshold}. Must be in [-1, 1]."
+        )
+    dsga_d_conflict_only_raw = train_cfg.get(
+        "dsga_d_conflict_only",
+        train_cfg.get("ma_laga_conflict_only", False),
+    )
+    if isinstance(dsga_d_conflict_only_raw, bool):
+        dsga_d_conflict_only = dsga_d_conflict_only_raw
     else:
-        ma_laga_norm_restore = str(ma_laga_norm_restore_raw).lower() in {"1", "true", "on", "yes"}
-    ma_laga_eps = float(train_cfg.get("ma_laga_eps", 1e-8))
-    if ma_laga_eps <= 0.0:
+        dsga_d_conflict_only = str(dsga_d_conflict_only_raw).lower() in {"1", "true", "on", "yes"}
+    dsga_m_norm_restore_raw = train_cfg.get("dsga_m_norm_restore", train_cfg.get("ma_laga_norm_restore", True))
+    if isinstance(dsga_m_norm_restore_raw, bool):
+        dsga_m_norm_restore = dsga_m_norm_restore_raw
+    else:
+        dsga_m_norm_restore = str(dsga_m_norm_restore_raw).lower() in {"1", "true", "on", "yes"}
+    dsga_layer_adaptive_blend_raw = train_cfg.get("dsga_layer_adaptive_blend", False)
+    if isinstance(dsga_layer_adaptive_blend_raw, bool):
+        dsga_layer_adaptive_blend = dsga_layer_adaptive_blend_raw
+    else:
+        dsga_layer_adaptive_blend = str(dsga_layer_adaptive_blend_raw).lower() in {"1", "true", "on", "yes"}
+    dsga_layer_adaptive_strength = float(train_cfg.get("dsga_layer_adaptive_strength", 1.0))
+    if dsga_layer_adaptive_strength < 0.0:
         raise ValueError(
-            f"Unsupported train.ma_laga_eps={ma_laga_eps}. Must be > 0."
+            f"Unsupported train.dsga_layer_adaptive_strength={dsga_layer_adaptive_strength}. Must be >= 0."
         )
+    dsga_layer_adaptive_power = float(train_cfg.get("dsga_layer_adaptive_power", 0.5))
+    if dsga_layer_adaptive_power <= 0.0:
+        raise ValueError(
+            f"Unsupported train.dsga_layer_adaptive_power={dsga_layer_adaptive_power}. Must be > 0."
+        )
+    dsga_m_eps = float(train_cfg.get("dsga_m_eps", train_cfg.get("ma_laga_eps", 1e-8)))
+    if dsga_m_eps <= 0.0:
+        raise ValueError(
+            f"Unsupported train.dsga_m_eps={dsga_m_eps}. Must be > 0."
+        )
+    dsga_preserve_target = _canonicalize_preserve_target(
+        train_cfg.get("dsga_preserve_target", train_cfg.get("ma_laga_preserve_target", "understanding")),
+        key="train.dsga_preserve_target",
+    )
 
     saop_eps = float(train_cfg.get("saop_eps", 1e-8))
     saop_log_norm_ratio_raw = train_cfg.get("saop_log_norm_ratio", False)
@@ -1174,6 +1680,9 @@ def main() -> None:
     metrics_file = os.path.join(run_dir, "metrics.jsonl")
     layer_probe_summary_file = os.path.join(run_dir, "layer_probe_summary.jsonl")
     layer_probe_dir = os.path.join(run_dir, "layer_probe")
+    dsga_probe_summary_file = os.path.join(run_dir, "dsga_probe_summary.jsonl")
+    dsga_probe_dir = os.path.join(run_dir, "dsga_probe")
+    dsga_mt_series_file = os.path.join(run_dir, "dsga_mt_series.jsonl")
     cos_curve = []
     temperature = float(cfg.get("text", {}).get("temperature", 0.07))
 
@@ -1181,6 +1690,7 @@ def main() -> None:
     last_target_rec_scale = 1.0
     last_gu_norm = 0.0
     last_gg_norm = 0.0
+    current_lr = 0.0 if warmup_steps > 0 else base_lr
 
     if accelerator.is_main_process:
         save_json(
@@ -1191,6 +1701,8 @@ def main() -> None:
                 "mode": mode,
                 "lambda_txt": lambda_txt,
                 "lambda_rec": lambda_rec,
+                "recon_loss": recon_loss_kind,
+                "recon_loss_eps": recon_loss_eps,
                 "cagrad_beta": cagrad_beta,
                 "cagrad_conflict_only": bool(cagrad_conflict_only),
                 "cagrad_conflict_threshold": cagrad_conflict_threshold,
@@ -1219,9 +1731,27 @@ def main() -> None:
                 "laga_alpha_power": laga_alpha_power,
                 "laga_alpha_min": laga_alpha_min,
                 "laga_alpha_max": laga_alpha_max,
-                "ma_laga_align_gamma": ma_laga_align_gamma,
-                "ma_laga_norm_restore": bool(ma_laga_norm_restore),
-                "ma_laga_eps": ma_laga_eps,
+                "laga_preserve_target": laga_preserve_target,
+                "dsga_m_align_gamma": dsga_m_align_gamma,
+                "dsga_m_scope": dsga_m_scope,
+                "dsga_d_mode": dsga_d_mode,
+                "dsga_d_conflict_threshold": dsga_d_conflict_threshold,
+                "dsga_d_conflict_only": bool(dsga_d_conflict_only),
+                "dsga_m_norm_restore": bool(dsga_m_norm_restore),
+                "dsga_preserve_target": dsga_preserve_target,
+                "dsga_layer_adaptive_blend": bool(dsga_layer_adaptive_blend),
+                "dsga_layer_adaptive_strength": dsga_layer_adaptive_strength,
+                "dsga_layer_adaptive_power": dsga_layer_adaptive_power,
+                "dsga_m_eps": dsga_m_eps,
+                # Legacy aliases kept for old downstream parsers.
+                "ma_laga_align_gamma": dsga_m_align_gamma,
+                "ma_laga_m_scope": dsga_m_scope,
+                "ma_laga_mode": dsga_d_mode,
+                "ma_laga_conflict_threshold": dsga_d_conflict_threshold,
+                "ma_laga_conflict_only": bool(dsga_d_conflict_only),
+                "ma_laga_norm_restore": bool(dsga_m_norm_restore),
+                "ma_laga_preserve_target": dsga_preserve_target,
+                "ma_laga_eps": dsga_m_eps,
                 "lambda_var": lambda_var,
                 "var_gamma": var_gamma,
                 "var_eps": var_eps,
@@ -1241,6 +1771,8 @@ def main() -> None:
                 "probe_every": probe_every,
                 "probe_until": probe_until,
                 "probe_num_groups": int(len(probe_ordered_groups)),
+                "base_lr": base_lr,
+                "warmup_steps": warmup_steps,
             },
             os.path.join(run_dir, "train_setup.json"),
         )
@@ -1276,6 +1808,13 @@ def main() -> None:
     pbar = tqdm(range(1, steps + 1), desc="train_cifar10", disable=not accelerator.is_local_main_process)
 
     for step in pbar:
+        if warmup_steps > 0 and step <= warmup_steps:
+            current_lr = base_lr * float(step) / float(max(1, warmup_steps))
+        else:
+            current_lr = base_lr
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = current_lr
+
         batch = make_batch_dict(next(train_iter))
         batch = to_device(batch, device)
 
@@ -1294,7 +1833,9 @@ def main() -> None:
             prototypes=model.text_prototypes,
             temperature=temperature,
         )
-        Lg = F.mse_loss(recon, images_target)
+        Lg_mse = F.mse_loss(recon, images_target)
+        Lg_rmse = torch.sqrt(Lg_mse + recon_loss_eps)
+        Lg = Lg_rmse if recon_loss_kind == "rmse" else Lg_mse
         Lvar = variance_loss_fn(out["feat"]) if lambda_var > 0.0 else Lu.new_zeros(())
         feat_for_gbvc = out["feat"]
         if feat_for_gbvc.ndim == 4:
@@ -1348,6 +1889,8 @@ def main() -> None:
         )
         probe_stats: Optional[Dict[str, float]] = None
         probe_csv_path = ""
+        dsga_probe_stats: Optional[Dict[str, float]] = None
+        dsga_probe_csv_path = ""
         if should_probe:
             raw_gu_probe = torch.autograd.grad(Lu, shared_params, retain_graph=True, allow_unused=True)
             raw_gg_probe = torch.autograd.grad(Lg, shared_params, retain_graph=True, allow_unused=True)
@@ -1368,6 +1911,30 @@ def main() -> None:
             )
             probe_stats = probe_stats_local
 
+            if strategy in {"ma_laga", "dsga"}:
+                dsga_rows, dsga_probe_stats_local = _compute_dsga_probe_rows(
+                    step=step,
+                    g_u=gu_probe,
+                    g_g=gg_probe,
+                    group_to_indices=probe_group_to_indices,
+                    group_to_depth=probe_group_to_depth,
+                    ordered_groups=probe_ordered_groups,
+                    align_gamma=dsga_m_align_gamma,
+                    mode=dsga_d_mode,
+                    conflict_threshold=dsga_d_conflict_threshold,
+                    conflict_only=dsga_d_conflict_only,
+                    norm_restore=dsga_m_norm_restore,
+                    eps=dsga_m_eps,
+                    magnitude_scope=dsga_m_scope,
+                    adaptive_layerwise_blend=dsga_layer_adaptive_blend,
+                    adaptive_blend_strength=dsga_layer_adaptive_strength,
+                    adaptive_blend_power=dsga_layer_adaptive_power,
+                    preserve_target=dsga_preserve_target,
+                )
+                dsga_probe_stats = dsga_probe_stats_local
+            else:
+                dsga_rows = []
+
             if accelerator.is_main_process and len(probe_rows) > 0:
                 probe_csv_path = os.path.join(layer_probe_dir, f"step_{step:07d}_layerwise.csv")
                 _save_layer_probe_csv(probe_csv_path, probe_rows)
@@ -1379,6 +1946,27 @@ def main() -> None:
                     f"depth_pearson={probe_stats['depth_cos_pearson']:.4f} "
                     f"depth_spearman={probe_stats['depth_cos_spearman']:.4f} "
                     f"csv={probe_csv_path}"
+                )
+
+            if accelerator.is_main_process and dsga_probe_stats is not None and len(dsga_rows) > 0:
+                dsga_probe_csv_path = os.path.join(dsga_probe_dir, f"step_{step:07d}_dsga.csv")
+                _save_dsga_probe_csv(dsga_probe_csv_path, dsga_rows)
+                dsga_probe_stats["probe_csv"] = dsga_probe_csv_path
+                append_jsonl(dsga_probe_summary_file, dsga_probe_stats)
+                append_jsonl(
+                    dsga_mt_series_file,
+                    {
+                        "step": int(step),
+                        "m_t": float(dsga_probe_stats["global_mt"] if dsga_m_scope == "global" else dsga_probe_stats["mean_mt"]),
+                        "clipped_flag": 0,
+                    },
+                )
+                accelerator.print(
+                    f"[dsga_probe] step={step} mean_r={dsga_probe_stats['mean_norm_ratio']:.4f} "
+                    f"mean_mt={dsga_probe_stats['mean_mt']:.4f} "
+                    f"mean_aw={dsga_probe_stats['mean_adaptive_weight']:.4f} "
+                    f"alpha_post={dsga_probe_stats['mean_abs_alpha_post_conflict']:.6f} "
+                    f"csv={dsga_probe_csv_path}"
                 )
 
         optimizer.zero_grad(set_to_none=True)
@@ -1463,6 +2051,7 @@ def main() -> None:
                 lambda_txt=lambda_txt,
                 lambda_rec=eff_lambda_rec,
                 group_to_indices=laga_groups,
+                preserve_target=laga_preserve_target,
                 eps=laga_eps,
                 conflict_threshold=laga_conflict_threshold,
                 restore_ratio=laga_restore_ratio,
@@ -1480,7 +2069,8 @@ def main() -> None:
                     if p.grad is not None:
                         p.grad = accelerator.reduce(p.grad, reduction="mean")
             optimizer.step()
-        elif strategy == "ma_laga":
+        elif strategy in {"ma_laga", "dsga"}:
+            # DSGA is implemented as DSGA-M (magnitude alignment) + DSGA-D (direction decomposition).
             cos = apply_ma_laga_objective(
                 loss_txt=Lu,
                 loss_rec=Lg,
@@ -1489,9 +2079,17 @@ def main() -> None:
                 lambda_txt=lambda_txt,
                 lambda_rec=eff_lambda_rec,
                 group_to_indices=laga_groups,
-                align_gamma=ma_laga_align_gamma,
-                norm_restore=ma_laga_norm_restore,
-                eps=ma_laga_eps,
+                preserve_target=dsga_preserve_target,
+                align_gamma=dsga_m_align_gamma,
+                norm_restore=dsga_m_norm_restore,
+                mode=dsga_d_mode,
+                conflict_threshold=dsga_d_conflict_threshold,
+                conflict_only=dsga_d_conflict_only,
+                eps=dsga_m_eps,
+                magnitude_scope=dsga_m_scope,
+                adaptive_layerwise_blend=dsga_layer_adaptive_blend,
+                adaptive_blend_strength=dsga_layer_adaptive_strength,
+                adaptive_blend_power=dsga_layer_adaptive_power,
                 grad_norm_mode=grad_norm_mode,
                 grad_norm_indices=grad_norm_indices,
                 grad_norm_conflict_only=grad_norm_conflict_only,
@@ -1531,6 +2129,8 @@ def main() -> None:
         cos_global = _dist_mean_scalar(accelerator, cos, device)
         Lu_global = _dist_mean_scalar(accelerator, Lu, device)
         Lg_global = _dist_mean_scalar(accelerator, Lg, device)
+        Lg_mse_global = _dist_mean_scalar(accelerator, Lg_mse, device)
+        Lg_rmse_global = _dist_mean_scalar(accelerator, Lg_rmse, device)
         Lvar_global = _dist_mean_scalar(accelerator, Lvar, device)
         Lgbvc_global = _dist_mean_scalar(accelerator, Lgbvc, device)
         total_global = _dist_mean_scalar(accelerator, total, device)
@@ -1553,7 +2153,9 @@ def main() -> None:
             "total": total_global,
             "cos": cos_global,
             "txt_acc": txt_acc_global,
-            "recon_mse": Lg_global,
+            "recon_loss_kind": recon_loss_kind,
+            "recon_mse": Lg_mse_global,
+            "recon_rmse": Lg_rmse_global,
             "strategy": strategy,
             "mode": mode,
             "lambda_txt": float(lambda_txt),
@@ -1566,6 +2168,7 @@ def main() -> None:
             "balance_gu_norm": float(last_gu_norm),
             "balance_gg_norm": float(last_gg_norm),
             "balance_gu_over_gg": float(last_gu_norm / max(last_gg_norm, 1e-12)),
+            "lr": float(current_lr),
         }
         if probe_stats is not None:
             row["probe_mean_cosine"] = float(probe_stats["mean_cosine"])
@@ -1580,6 +2183,15 @@ def main() -> None:
                 / max(float(eff_lambda_rec) * float(probe_stats["global_gg_norm"]), 1e-12)
             )
             row["probe_csv"] = str(probe_csv_path)
+        if dsga_probe_stats is not None:
+            row["probe_dsga_mean_norm_ratio"] = float(dsga_probe_stats["mean_norm_ratio"])
+            row["probe_dsga_mean_mt"] = float(dsga_probe_stats["mean_mt"])
+            row["probe_dsga_global_mt"] = float(dsga_probe_stats["global_mt"])
+            row["probe_dsga_mean_abs_alpha_post_conflict"] = float(dsga_probe_stats["mean_abs_alpha_post_conflict"])
+            row["probe_dsga_conflict_fraction"] = float(dsga_probe_stats["conflict_fraction"])
+            row["probe_dsga_num_projected"] = int(dsga_probe_stats["num_projected"])
+            row["probe_dsga_mean_adaptive_weight"] = float(dsga_probe_stats["mean_adaptive_weight"])
+            row["probe_dsga_csv"] = str(dsga_probe_csv_path)
 
         if accelerator.is_main_process and (step % log_every == 0 or step == 1 or step == steps):
             append_jsonl(metrics_file, row)
@@ -1675,9 +2287,27 @@ def main() -> None:
             "laga_alpha_power": laga_alpha_power,
             "laga_alpha_min": laga_alpha_min,
             "laga_alpha_max": laga_alpha_max,
-            "ma_laga_align_gamma": ma_laga_align_gamma,
-            "ma_laga_norm_restore": bool(ma_laga_norm_restore),
-            "ma_laga_eps": ma_laga_eps,
+            "laga_preserve_target": laga_preserve_target,
+            "dsga_m_align_gamma": dsga_m_align_gamma,
+            "dsga_m_scope": dsga_m_scope,
+            "dsga_d_mode": dsga_d_mode,
+            "dsga_d_conflict_threshold": dsga_d_conflict_threshold,
+            "dsga_d_conflict_only": bool(dsga_d_conflict_only),
+            "dsga_m_norm_restore": bool(dsga_m_norm_restore),
+            "dsga_preserve_target": dsga_preserve_target,
+            "dsga_layer_adaptive_blend": bool(dsga_layer_adaptive_blend),
+            "dsga_layer_adaptive_strength": dsga_layer_adaptive_strength,
+            "dsga_layer_adaptive_power": dsga_layer_adaptive_power,
+            "dsga_m_eps": dsga_m_eps,
+            # Legacy aliases kept for old downstream parsers.
+            "ma_laga_align_gamma": dsga_m_align_gamma,
+            "ma_laga_m_scope": dsga_m_scope,
+            "ma_laga_mode": dsga_d_mode,
+            "ma_laga_conflict_threshold": dsga_d_conflict_threshold,
+            "ma_laga_conflict_only": bool(dsga_d_conflict_only),
+            "ma_laga_norm_restore": bool(dsga_m_norm_restore),
+            "ma_laga_preserve_target": dsga_preserve_target,
+            "ma_laga_eps": dsga_m_eps,
             "lambda_var": lambda_var,
             "var_gamma": var_gamma,
             "var_eps": var_eps,
@@ -1699,6 +2329,9 @@ def main() -> None:
             "probe_every": probe_every,
             "probe_until": probe_until,
             "probe_num_groups": int(len(probe_ordered_groups)),
+            "base_lr": float(base_lr),
+            "warmup_steps": int(warmup_steps),
+            "final_lr": float(current_lr),
             "cos_mean": cos_mean,
             "cos_neg_ratio": cos_neg_ratio,
             "world_size": accelerator.num_processes,

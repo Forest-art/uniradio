@@ -22,17 +22,21 @@ CIFAR10_MEAN = [0.4914, 0.4822, 0.4465]
 CIFAR10_STD = [0.2470, 0.2435, 0.2616]
 CIFAR100_MEAN = [0.5071, 0.4867, 0.4408]
 CIFAR100_STD = [0.2675, 0.2565, 0.2761]
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
 
 
 def _normalize_dataset_name(dataset: str) -> str:
     d = str(dataset).lower()
-    if d in {"cifar10", "cifar100"}:
+    if d in {"cifar10", "cifar100", "sun397"}:
         return d
-    raise ValueError(f"Unsupported dataset={dataset}. Use cifar10|cifar100.")
+    raise ValueError(f"Unsupported dataset={dataset}. Use cifar10|cifar100|sun397.")
 
 
 def _dataset_stats(dataset: str) -> Tuple[List[float], List[float]]:
     d = _normalize_dataset_name(dataset)
+    if d == "sun397":
+        return IMAGENET_MEAN, IMAGENET_STD
     if d == "cifar100":
         return CIFAR100_MEAN, CIFAR100_STD
     return CIFAR10_MEAN, CIFAR10_STD
@@ -40,11 +44,15 @@ def _dataset_stats(dataset: str) -> Tuple[List[float], List[float]]:
 
 def _dataset_num_classes(dataset: str) -> int:
     d = _normalize_dataset_name(dataset)
+    if d == "sun397":
+        return 397
     return 100 if d == "cifar100" else 10
 
 
 def _dataset_torchvision_cls(dataset: str):
     d = _normalize_dataset_name(dataset)
+    if d == "sun397":
+        return datasets.SUN397
     return datasets.CIFAR100 if d == "cifar100" else datasets.CIFAR10
 
 
@@ -61,6 +69,45 @@ def build_cifar10_transforms(
     dataset: str = "cifar10",
 ) -> transforms.Compose:
     mean, std = _dataset_stats(dataset)
+    dataset_name = _normalize_dataset_name(dataset)
+
+    if dataset_name == "sun397":
+        if split == "train":
+            aug_strength = str(aug_strength).lower()
+            if aug_strength == "light":
+                aug = [
+                    transforms.RandomResizedCrop(image_size, scale=(0.7, 1.0)),
+                    transforms.RandomHorizontalFlip(),
+                ]
+            elif aug_strength == "strong":
+                aug = [
+                    transforms.RandomResizedCrop(image_size, scale=(0.5, 1.0)),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ColorJitter(0.4, 0.4, 0.4, 0.1),
+                ]
+            else:
+                aug = [
+                    transforms.RandomResizedCrop(image_size, scale=(0.6, 1.0)),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ColorJitter(0.2, 0.2, 0.2, 0.05),
+                ]
+            return transforms.Compose(
+                aug
+                + [
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean, std),
+                ]
+            )
+
+        return transforms.Compose(
+            [
+                transforms.Resize(int(image_size * 1.14), antialias=True),
+                transforms.CenterCrop(image_size),
+                transforms.ToTensor(),
+                transforms.Normalize(mean, std),
+            ]
+        )
+
     resize_ops = []
     if image_size != 32:
         resize_ops = _resize_ops(image_size)
@@ -151,6 +198,27 @@ class MultiViewCIFARWrapper(Dataset):
         }
 
 
+class HFImageLabelDataset(Dataset):
+    def __init__(self, hf_dataset, transform, image_key: str = "image", label_key: str = "label"):
+        self.dataset = hf_dataset
+        self.transform = transform
+        self.image_key = image_key
+        self.label_key = label_key
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, index: int):
+        item = self.dataset[index]
+        image = item[self.image_key]
+        label = int(item[self.label_key])
+        if hasattr(image, "mode") and image.mode != "RGB":
+            image = image.convert("RGB")
+        if self.transform is not None:
+            image = self.transform(image)
+        return image, label
+
+
 def _make_split_indices(length: int, val_ratio: float, seed: int) -> Tuple[List[int], List[int]]:
     n_val = int(round(length * val_ratio))
     n_val = max(1, min(length - 1, n_val))
@@ -212,6 +280,13 @@ def build_cifar10_dataset(
     aug_strength: str = "medium",
     target_source: str = "view1",
     dataset: str = "cifar10",
+    sun_source: str = "hf",
+    sun_hf_dataset: str = "dpdl-benchmark/sun397",
+    sun_hf_cache_dir: Optional[str] = None,
+    sun_hf_image_key: str = "image",
+    sun_hf_label_key: str = "label",
+    sun_max_train_samples: int = 0,
+    sun_max_eval_samples: int = 0,
 ) -> Tuple[Dataset, List[str]]:
     dataset_name = _normalize_dataset_name(dataset)
     num_classes = _dataset_num_classes(dataset_name)
@@ -256,9 +331,66 @@ def build_cifar10_dataset(
 
     data_root = str(Path(data_root).expanduser())
 
+    if dataset_name == "sun397":
+        if two_view:
+            raise ValueError("two_view is not supported for sun397 in this training path.")
+
+        sun_source_norm = str(sun_source).lower()
+        if sun_source_norm in {"hf", "huggingface"}:
+            try:
+                from datasets import load_dataset
+            except ImportError as e:
+                raise ImportError("datasets package is required for sun397 with sun_source=hf") from e
+
+            hf_split = {"train": "train", "val": "validation", "test": "test"}[split]
+            ds_hf = load_dataset(sun_hf_dataset, split=hf_split, cache_dir=sun_hf_cache_dir)
+
+            max_samples = int(sun_max_train_samples if split == "train" else sun_max_eval_samples)
+            if max_samples > 0:
+                n = min(max_samples, len(ds_hf))
+                # Keep contiguous head subset to avoid forcing full-shard shuffle downloads in quick experiments.
+                ds_hf = ds_hf.select(range(n))
+
+            ds = HFImageLabelDataset(
+                hf_dataset=ds_hf,
+                transform=tfm,
+                image_key=sun_hf_image_key,
+                label_key=sun_hf_label_key,
+            )
+            feat = ds_hf.features.get(sun_hf_label_key) if hasattr(ds_hf, "features") else None
+            names = list(feat.names) if (feat is not None and hasattr(feat, "names") and feat.names is not None) else []
+            if len(names) == num_classes:
+                return ds, [str(x) for x in names]
+            return ds, [f"class_{i}" for i in range(num_classes)]
+
+        if sun_source_norm in {"torchvision", "tv"}:
+            full = dataset_cls(root=data_root, transform=tfm, download=download)
+            n = len(full)
+            n_val = int(round(n * val_ratio))
+            n_test = n_val
+            n_train = max(1, n - n_val - n_test)
+            g = torch.Generator()
+            g.manual_seed(seed)
+            perm = torch.randperm(n, generator=g).tolist()
+            train_idx = perm[:n_train]
+            val_idx = perm[n_train : n_train + n_val]
+            test_idx = perm[n_train + n_val :]
+            if split == "train":
+                ds = Subset(full, train_idx)
+            elif split == "val":
+                ds = Subset(full, val_idx)
+            else:
+                ds = Subset(full, test_idx)
+            return ds, _extract_class_names(full, num_classes=num_classes)
+
+        raise ValueError(f"Unsupported sun_source={sun_source}. Use hf|torchvision.")
+
     if split == "train":
         if two_view:
-            base = dataset_cls(root=data_root, train=True, transform=None, download=download)
+            base: Dataset = dataset_cls(root=data_root, train=True, transform=None, download=download)
+            if val_from_train:
+                train_idx, _ = _make_split_indices(len(base), val_ratio=val_ratio, seed=seed)
+                base = Subset(base, train_idx)
             view1_tfm, view2_tfm, target_tfm = build_cifar10_multi_view_transforms(
                 dataset=dataset_name,
                 image_size=image_size,
@@ -272,7 +404,12 @@ def build_cifar10_dataset(
                 target_source=target_source,
             )
         else:
-            ds = dataset_cls(root=data_root, train=True, transform=tfm, download=download)
+            base = dataset_cls(root=data_root, train=True, transform=tfm, download=download)
+            if val_from_train:
+                train_idx, _ = _make_split_indices(len(base), val_ratio=val_ratio, seed=seed)
+                ds = Subset(base, train_idx)
+            else:
+                ds = base
         return ds, _extract_class_names(ds, num_classes=num_classes)
 
     if split == "test":
@@ -311,6 +448,13 @@ def build_cifar10_loader(
     aug_strength: str = "medium",
     target_source: str = "view1",
     dataset: str = "cifar10",
+    sun_source: str = "hf",
+    sun_hf_dataset: str = "dpdl-benchmark/sun397",
+    sun_hf_cache_dir: Optional[str] = None,
+    sun_hf_image_key: str = "image",
+    sun_hf_label_key: str = "label",
+    sun_max_train_samples: int = 0,
+    sun_max_eval_samples: int = 0,
 ) -> Tuple[DataLoader, List[str]]:
     ds, class_names = build_cifar10_dataset(
         dataset=dataset,
@@ -328,6 +472,13 @@ def build_cifar10_loader(
         two_view=two_view,
         aug_strength=aug_strength,
         target_source=target_source,
+        sun_source=sun_source,
+        sun_hf_dataset=sun_hf_dataset,
+        sun_hf_cache_dir=sun_hf_cache_dir,
+        sun_hf_image_key=sun_hf_image_key,
+        sun_hf_label_key=sun_hf_label_key,
+        sun_max_train_samples=sun_max_train_samples,
+        sun_max_eval_samples=sun_max_eval_samples,
     )
 
     if shuffle is None:

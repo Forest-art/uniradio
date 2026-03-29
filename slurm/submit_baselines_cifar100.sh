@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-DATA_ROOT=${DATA_ROOT:-/project/peilab/luxiaocheng/projects/unirae_radio/data/cifar100}
+DATA_ROOT=${DATA_ROOT:-/project/peilab/luxiaocheng/projects/DSGA/data/cifar100}
 STEPS=${STEPS:-5000}
 SEEDS=${SEEDS:-42}
 RUN_PREFIX=${RUN_PREFIX:-baseline5_cifar100}

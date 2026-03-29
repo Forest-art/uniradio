@@ -58,6 +58,7 @@ decoder:
   feature_target_dim: 1024
   pixel_size: 64
   token_dropout: 0.0
+  noise_tau: 0.8
 
 recon:
   target: feature_recon  # feature_recon | pixel_recon

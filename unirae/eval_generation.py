@@ -91,6 +91,7 @@ def _build_decoder_from_cfg(cfg: Dict, dino_dim: int) -> ReconDecoder:
         pixel_size=int(dec_cfg.get("pixel_size", 64)),
         hidden_dim=int(dec_cfg.get("hidden_dim", 1024)),
         token_dropout=float(dec_cfg.get("token_dropout", 0.0)),
+        noise_tau=float(dec_cfg.get("noise_tau", 0.8)),
     )
 
 

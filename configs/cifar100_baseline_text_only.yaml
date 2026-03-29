@@ -9,7 +9,7 @@ output:
 
 data:
   dataset: cifar100
-  root: /project/peilab/luxiaocheng/projects/unirae_radio/data/cifar100
+  root: /project/peilab/luxiaocheng/projects/DSGA/data/cifar100
   image_size: 32
   batch_size: 128
   num_workers: 8

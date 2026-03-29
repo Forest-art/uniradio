@@ -6,7 +6,7 @@ Baseline CIFAR-10 training currently uses:
 - apply_cagrad
 - apply_saop
 - apply_laga_objective
-- apply_ma_laga_objective
+- apply_ma_laga_objective (DSGA-M + DSGA-D)
 - compute_grad_cosine
 
 Other layer-wise helpers below are kept for legacy run compatibility.
@@ -64,6 +64,133 @@ def _group_l2_norm(grads: Sequence[torch.Tensor], eps: float = 1e-12) -> torch.T
     for g in grads:
         acc = acc + torch.sum(g * g)
     return torch.sqrt(acc.clamp_min(eps))
+
+
+def _safe_cosine_flat(g1: torch.Tensor, g2: torch.Tensor, eps: float = 1e-12) -> float:
+    n1 = float(torch.linalg.norm(g1).item())
+    n2 = float(torch.linalg.norm(g2).item())
+    if n1 <= eps or n2 <= eps:
+        return 0.0
+    return float(torch.dot(g1, g2).item() / (n1 * n2 + eps))
+
+
+def _canonicalize_preserve_target(preserve_target: str) -> str:
+    key = str(preserve_target).strip().lower()
+    aliases = {
+        "u": "understanding",
+        "txt": "understanding",
+        "text": "understanding",
+        "understanding": "understanding",
+        "g": "generation",
+        "gen": "generation",
+        "rec": "generation",
+        "recon": "generation",
+        "reconstruction": "generation",
+        "generation": "generation",
+        "sym": "symmetric",
+        "symmetric": "symmetric",
+        "neutral": "symmetric",
+        "none": "symmetric",
+        "neither": "symmetric",
+    }
+    if key not in aliases:
+        raise ValueError(
+            f"Unsupported preserve_target={preserve_target}. "
+            "Use understanding|generation|symmetric."
+        )
+    return aliases[key]
+
+
+def _symmetric_balance_scales(
+    norm_u: torch.Tensor,
+    norm_g: torch.Tensor,
+    gamma: float,
+    eps: float = 1e-12,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    gamma = float(max(0.0, gamma))
+    if gamma == 0.0:
+        one = torch.ones((), device=norm_u.device, dtype=norm_u.dtype)
+        return one, one
+    half_gamma = 0.5 * gamma
+    scale_u = torch.pow((norm_g / (norm_u + eps)).clamp_min(eps), half_gamma).detach()
+    scale_g = torch.pow((norm_u / (norm_g + eps)).clamp_min(eps), half_gamma).detach()
+    return scale_u, scale_g
+
+
+def _symmetric_project_pair(
+    grads_u: Sequence[torch.Tensor],
+    grads_g: Sequence[torch.Tensor],
+    eps: float = 1e-12,
+) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    flat_u = _flatten(grads_u)
+    flat_g = _flatten(grads_g)
+    dot_ug = torch.dot(flat_u, flat_g)
+    norm_uu = torch.dot(flat_u, flat_u).clamp_min(eps)
+    norm_gg = torch.dot(flat_g, flat_g).clamp_min(eps)
+    proj_u = (dot_ug / norm_gg).detach()
+    proj_g = (dot_ug / norm_uu).detach()
+    u_proj = [gu - proj_u * gg for gu, gg in zip(grads_u, grads_g)]
+    g_proj = [gg - proj_g * gu for gu, gg in zip(grads_u, grads_g)]
+    return u_proj, g_proj
+
+
+def _blend_dsga_with_global_anchor(
+    grads_u: Sequence[torch.Tensor],
+    grads_g: Sequence[torch.Tensor],
+    merged_global: Sequence[torch.Tensor],
+    merged_local: Sequence[torch.Tensor],
+    groups: Dict[str, Sequence[int]],
+    adaptive_blend_strength: float,
+    adaptive_blend_power: float,
+    eps: float = 1e-8,
+) -> List[torch.Tensor]:
+    """Blend a global DSGA anchor with selective layerwise deviations.
+
+    The layerwise branch only gets weight when a group is more conflicting than
+    the global shared-parameter gradient geometry. This keeps the global method
+    as a stable fallback while still letting truly heterogeneous layers deviate.
+    """
+    merged = [g.clone() for g in merged_global]
+    if len(groups) <= 1:
+        return merged
+
+    adaptive_blend_strength = float(max(0.0, adaptive_blend_strength))
+    adaptive_blend_power = float(max(1e-6, adaptive_blend_power))
+    if adaptive_blend_strength <= 0.0:
+        return merged
+
+    gu_all = _flatten(grads_u)
+    gg_all = _flatten(grads_g)
+    global_cos = _safe_cosine_flat(gu_all, gg_all, eps=eps)
+    total_energy = float(torch.linalg.norm(gu_all).item() + torch.linalg.norm(gg_all).item())
+
+    covered: Set[int] = set()
+    for raw_indices in groups.values():
+        idxs = [int(i) for i in raw_indices if 0 <= int(i) < len(grads_u)]
+        if len(idxs) == 0:
+            continue
+        covered.update(idxs)
+
+        gu_group = [grads_u[i] for i in idxs]
+        gg_group = [grads_g[i] for i in idxs]
+        gu_flat = _flatten(gu_group)
+        gg_flat = _flatten(gg_group)
+        local_cos = _safe_cosine_flat(gu_flat, gg_flat, eps=eps)
+
+        local_energy = float(torch.linalg.norm(gu_flat).item() + torch.linalg.norm(gg_flat).item())
+        energy_share = local_energy / max(total_energy, eps)
+        conflict_gain = max(0.0, 0.5 * (global_cos - local_cos))
+        blend_weight = adaptive_blend_strength * conflict_gain * (energy_share ** adaptive_blend_power)
+        blend_weight = float(min(max(blend_weight, 0.0), 1.0))
+
+        for idx in idxs:
+            merged[idx] = (1.0 - blend_weight) * merged_global[idx] + blend_weight * merged_local[idx]
+
+    for idx in range(len(grads_u)):
+        if idx not in covered:
+            merged[idx] = merged_global[idx]
+
+    return merged
 
 
 def _normalize_two_task_grads(
@@ -232,6 +359,7 @@ def apply_laga(
     grads_u: Sequence[torch.Tensor],
     grads_g: Sequence[torch.Tensor],
     layers: Optional[Dict[str, Sequence[int]]],
+    preserve_target: str = "understanding",
     eps: float = 1e-8,
     conflict_threshold: float = 0.0,
     restore_ratio: float = 0.0,
@@ -257,6 +385,56 @@ def apply_laga(
         )
     if len(grads_u) == 0:
         return []
+    preserve_target = _canonicalize_preserve_target(preserve_target)
+    if preserve_target == "generation":
+        return apply_laga(
+            grads_u=grads_g,
+            grads_g=grads_u,
+            layers=layers,
+            preserve_target="understanding",
+            eps=eps,
+            conflict_threshold=conflict_threshold,
+            restore_ratio=restore_ratio,
+            alpha_mode=alpha_mode,
+            alpha_power=alpha_power,
+            alpha_min=alpha_min,
+            alpha_max=alpha_max,
+        )
+    if preserve_target == "symmetric":
+        eps = float(max(1e-12, eps))
+        conflict_threshold = float(conflict_threshold)
+        merged = [torch.zeros_like(g) for g in grads_u]
+        if not layers:
+            groups = {"all": list(range(len(grads_u)))}
+        else:
+            groups = layers
+
+        covered: Set[int] = set()
+        for _, raw_indices in groups.items():
+            idxs = [int(i) for i in raw_indices if 0 <= int(i) < len(grads_u)]
+            if len(idxs) == 0:
+                continue
+            covered.update(idxs)
+
+            gu_group = [grads_u[i] for i in idxs]
+            gg_group = [grads_g[i] for i in idxs]
+            gu_flat = _flatten(gu_group)
+            gg_flat = _flatten(gg_group)
+            dot_ug = torch.dot(gu_flat, gg_flat)
+            norm_u = torch.linalg.norm(gu_flat)
+            norm_g = torch.linalg.norm(gg_flat)
+            cos = dot_ug / (norm_u * norm_g + eps)
+            use_projection = (float(cos.item()) < conflict_threshold) and (float(dot_ug.item()) < 0.0)
+            if use_projection:
+                gu_group, gg_group = _symmetric_project_pair(gu_group, gg_group, eps=eps)
+            merged_group = [gu + gg for gu, gg in zip(gu_group, gg_group)]
+            for idx, g in zip(idxs, merged_group):
+                merged[idx] = g
+
+        for idx in range(len(grads_u)):
+            if idx not in covered:
+                merged[idx] = grads_u[idx] + grads_g[idx]
+        return merged
 
     eps = float(max(1e-12, eps))
     conflict_threshold = float(conflict_threshold)
@@ -331,41 +509,85 @@ def apply_ma_laga(
     grads_u: Sequence[torch.Tensor],
     grads_g: Sequence[torch.Tensor],
     layers: Optional[Dict[str, Sequence[int]]],
+    preserve_target: str = "understanding",
     align_gamma: float = 0.5,
     align_max_scale: float = 0.0,
     norm_restore: bool = True,
     mode: str = "full",
+    conflict_threshold: float = 0.0,
+    conflict_only: bool = False,
     eps: float = 1e-8,
+    magnitude_scope: str = "layerwise",
+    adaptive_layerwise_blend: bool = False,
+    adaptive_blend_strength: float = 1.0,
+    adaptive_blend_power: float = 0.5,
 ) -> List[torch.Tensor]:
-    """Magnitude-Aligned LAGA (MA-LAGA).
+    """DSGA-M + DSGA-D merge core (legacy name: MA-LAGA).
 
     Supported modes:
-      - full: MA + LAGA (align then conflict projection).
+      - full: DSGA-M + DSGA-D (align then conflict projection).
       - capped_full: cap alignment scale then apply LAGA projection on conflicts.
       - direction_only: pure LAGA without magnitude alignment.
       - magnitude_only: pure MA without projection (always sum aligned gradients).
       - nr_laga: project generation gradient on conflicts, then restore to its own norm.
+
+    Args:
+        magnitude_scope:
+            - "layerwise": DSGA-M scale is computed per direction-routing group.
+            - "global": DSGA-M scale is computed once from all shared params, while
+              DSGA-D direction routing still follows ``layers`` grouping.
     """
     if len(grads_u) != len(grads_g):
         raise ValueError(
-            f"MA-LAGA gradient length mismatch: len(grads_u)={len(grads_u)} len(grads_g)={len(grads_g)}"
+            f"DSGA-M/DSGA-D gradient length mismatch: len(grads_u)={len(grads_u)} len(grads_g)={len(grads_g)}"
         )
     if len(grads_u) == 0:
         return []
+    preserve_target = _canonicalize_preserve_target(preserve_target)
+    if preserve_target == "generation":
+        return apply_ma_laga(
+            grads_u=grads_g,
+            grads_g=grads_u,
+            layers=layers,
+            preserve_target="understanding",
+            align_gamma=align_gamma,
+            align_max_scale=align_max_scale,
+            norm_restore=norm_restore,
+            mode=mode,
+            conflict_threshold=conflict_threshold,
+            conflict_only=conflict_only,
+            eps=eps,
+            magnitude_scope=magnitude_scope,
+            adaptive_layerwise_blend=adaptive_layerwise_blend,
+            adaptive_blend_strength=adaptive_blend_strength,
+            adaptive_blend_power=adaptive_blend_power,
+        )
 
     eps = float(max(1e-12, eps))
     align_gamma = float(max(0.0, align_gamma))
     align_max_scale = float(align_max_scale)
     norm_restore = bool(norm_restore)
+    conflict_threshold = float(conflict_threshold)
+    if not (-1.0 <= conflict_threshold <= 1.0):
+        raise ValueError(
+            f"DSGA-D conflict_threshold must be in [-1, 1], got {conflict_threshold}."
+        )
+    conflict_only = bool(conflict_only)
     mode = str(mode).lower()
     if mode not in {"full", "capped_full", "direction_only", "magnitude_only", "nr_laga"}:
         raise ValueError(
-            f"Unsupported MA-LAGA mode={mode}. "
+            f"Unsupported DSGA-D mode={mode}. "
             "Use one of: full|capped_full|direction_only|magnitude_only|nr_laga."
         )
     if mode == "capped_full" and align_max_scale <= 0.0:
         raise ValueError(
-            f"MA-LAGA capped_full requires align_max_scale>0, got {align_max_scale}."
+            f"DSGA-M capped_full requires align_max_scale>0, got {align_max_scale}."
+        )
+    magnitude_scope = str(magnitude_scope).lower()
+    if magnitude_scope not in {"layerwise", "global"}:
+        raise ValueError(
+            f"Unsupported DSGA-M magnitude_scope={magnitude_scope}. "
+            "Use one of: layerwise|global."
         )
     merged = [torch.zeros_like(g) for g in grads_u]
 
@@ -373,6 +595,70 @@ def apply_ma_laga(
         groups: Dict[str, Sequence[int]] = {"all": list(range(len(grads_u)))}
     else:
         groups = layers
+
+    adaptive_layerwise_blend = bool(adaptive_layerwise_blend)
+    adaptive_blend_strength = float(max(0.0, adaptive_blend_strength))
+    adaptive_blend_power = float(max(1e-6, adaptive_blend_power))
+    if adaptive_layerwise_blend and len(groups) > 1:
+        merged_global = apply_ma_laga(
+            grads_u=grads_u,
+            grads_g=grads_g,
+            layers={"all": list(range(len(grads_u)))},
+            preserve_target=preserve_target,
+            align_gamma=align_gamma,
+            align_max_scale=align_max_scale,
+            norm_restore=norm_restore,
+            mode=mode,
+            conflict_threshold=conflict_threshold,
+            conflict_only=conflict_only,
+            eps=eps,
+            magnitude_scope="global",
+            adaptive_layerwise_blend=False,
+            adaptive_blend_strength=adaptive_blend_strength,
+            adaptive_blend_power=adaptive_blend_power,
+        )
+        merged_local = apply_ma_laga(
+            grads_u=grads_u,
+            grads_g=grads_g,
+            layers=groups,
+            preserve_target=preserve_target,
+            align_gamma=align_gamma,
+            align_max_scale=align_max_scale,
+            norm_restore=norm_restore,
+            mode=mode,
+            conflict_threshold=conflict_threshold,
+            conflict_only=conflict_only,
+            eps=eps,
+            magnitude_scope=magnitude_scope,
+            adaptive_layerwise_blend=False,
+            adaptive_blend_strength=adaptive_blend_strength,
+            adaptive_blend_power=adaptive_blend_power,
+        )
+        return _blend_dsga_with_global_anchor(
+            grads_u=grads_u,
+            grads_g=grads_g,
+            merged_global=merged_global,
+            merged_local=merged_local,
+            groups=groups,
+            adaptive_blend_strength=adaptive_blend_strength,
+            adaptive_blend_power=adaptive_blend_power,
+            eps=eps,
+        )
+
+    global_scale_factor: Optional[torch.Tensor] = None
+    global_scale_u: Optional[torch.Tensor] = None
+    global_scale_g: Optional[torch.Tensor] = None
+    if magnitude_scope == "global" and mode not in {"direction_only", "nr_laga"}:
+        gu_all = _flatten(grads_u)
+        gg_all = _flatten(grads_g)
+        m_u_all = torch.linalg.norm(gu_all)
+        m_g_all = torch.linalg.norm(gg_all)
+        if preserve_target == "symmetric":
+            global_scale_u, global_scale_g = _symmetric_balance_scales(m_u_all, m_g_all, align_gamma, eps=eps)
+        elif mode == "capped_full":
+            global_scale_factor = torch.clamp(m_u_all / (m_g_all + eps), max=align_max_scale).detach()
+        else:
+            global_scale_factor = torch.pow((m_u_all / (m_g_all + eps)).clamp_min(eps), align_gamma).detach()
 
     covered: Set[int] = set()
     for _, raw_indices in groups.items():
@@ -390,10 +676,30 @@ def apply_ma_laga(
         m_g = torch.linalg.norm(gg_flat)
         dot_ug = torch.dot(gu_flat, gg_flat)
         cos = dot_ug / (m_u * m_g + eps)
+        cos_v = float(cos.item())
+        is_conflict = cos_v < conflict_threshold
 
-        if mode == "direction_only":
+        if preserve_target == "symmetric" and mode == "direction_only":
+            if not is_conflict:
+                merged_group = [gu + gg for gu, gg in zip(gu_group, gg_group)]
+            else:
+                gu_proj_group, gg_proj_group = _symmetric_project_pair(gu_group, gg_group, eps=eps)
+                merged_group = [gu + gg for gu, gg in zip(gu_proj_group, gg_proj_group)]
+        elif preserve_target == "symmetric" and mode == "nr_laga":
+            if not is_conflict:
+                merged_group = [gu + gg for gu, gg in zip(gu_group, gg_group)]
+            else:
+                gu_proj_group, gg_proj_group = _symmetric_project_pair(gu_group, gg_group, eps=eps)
+                norm_u_proj = torch.linalg.norm(_flatten(gu_proj_group))
+                norm_g_proj = torch.linalg.norm(_flatten(gg_proj_group))
+                restore_u = m_u / (norm_u_proj + eps)
+                restore_g = m_g / (norm_g_proj + eps)
+                gu_proj_group = [restore_u * gu for gu in gu_proj_group]
+                gg_proj_group = [restore_g * gg for gg in gg_proj_group]
+                merged_group = [gu + gg for gu, gg in zip(gu_proj_group, gg_proj_group)]
+        elif mode == "direction_only":
             # Pure LAGA: no magnitude alignment.
-            if float(cos.item()) >= 0.0:
+            if not is_conflict:
                 merged_group = [gu + gg for gu, gg in zip(gu_group, gg_group)]
             else:
                 proj_coeff = dot_ug / (torch.dot(gu_flat, gu_flat) + eps)
@@ -401,7 +707,7 @@ def apply_ma_laga(
                 merged_group = [gu + gg_perp for gu, gg_perp in zip(gu_group, gg_perp_group)]
         elif mode == "nr_laga":
             # Norm-Restored LAGA: no alignment to understanding norm.
-            if float(cos.item()) >= 0.0:
+            if not is_conflict:
                 merged_group = [gu + gg for gu, gg in zip(gu_group, gg_group)]
             else:
                 proj_coeff = dot_ug / (torch.dot(gu_flat, gu_flat) + eps)
@@ -412,29 +718,74 @@ def apply_ma_laga(
                 merged_group = [gu + gg_perp for gu, gg_perp in zip(gu_group, gg_perp_group)]
         else:
             # Magnitude alignment stage.
-            if mode == "capped_full":
-                scale_factor = torch.clamp(m_u / (m_g + eps), max=align_max_scale).detach()
-            else:
-                scale_factor = torch.pow((m_u / (m_g + eps)).clamp_min(eps), align_gamma).detach()
-            gg_aligned_group = [scale_factor * gg for gg in gg_group]
-
-            if mode == "magnitude_only":
-                # Pure MA: never project, always add aligned generation gradient.
-                merged_group = [gu + gg_aligned for gu, gg_aligned in zip(gu_group, gg_aligned_group)]
-            else:
-                # Full MA-LAGA.
-                if float(cos.item()) >= 0.0:
-                    merged_group = [gu + gg_aligned for gu, gg_aligned in zip(gu_group, gg_aligned_group)]
+            if preserve_target == "symmetric":
+                if magnitude_scope == "global":
+                    if global_scale_u is None or global_scale_g is None:
+                        raise RuntimeError("global symmetric DSGA-M scales are unexpectedly None.")
+                    scale_u = global_scale_u
+                    scale_g = global_scale_g
                 else:
-                    gg_aligned_flat = _flatten(gg_aligned_group)
-                    proj_coeff = torch.dot(gg_aligned_flat, gu_flat) / (torch.dot(gu_flat, gu_flat) + eps)
-                    gg_perp_group = [gg_aligned - proj_coeff * gu for gu, gg_aligned in zip(gu_group, gg_aligned_group)]
-                    if norm_restore:
-                        norm_aligned = torch.linalg.norm(gg_aligned_flat)
-                        norm_perp = torch.linalg.norm(_flatten(gg_perp_group))
-                        restore_scale = norm_aligned / (norm_perp + eps)
-                        gg_perp_group = [restore_scale * gg_perp for gg_perp in gg_perp_group]
-                    merged_group = [gu + gg_perp for gu, gg_perp in zip(gu_group, gg_perp_group)]
+                    scale_u, scale_g = _symmetric_balance_scales(m_u, m_g, align_gamma, eps=eps)
+                gu_aligned_group = [scale_u * gu for gu in gu_group]
+                gg_aligned_group = [scale_g * gg for gg in gg_group]
+                if mode == "magnitude_only":
+                    if conflict_only and (not is_conflict):
+                        merged_group = [gu + gg for gu, gg in zip(gu_group, gg_group)]
+                    else:
+                        merged_group = [gu + gg for gu, gg in zip(gu_aligned_group, gg_aligned_group)]
+                else:
+                    if not is_conflict:
+                        if conflict_only:
+                            merged_group = [gu + gg for gu, gg in zip(gu_group, gg_group)]
+                        else:
+                            merged_group = [gu + gg for gu, gg in zip(gu_aligned_group, gg_aligned_group)]
+                    else:
+                        gu_proj_group, gg_proj_group = _symmetric_project_pair(gu_aligned_group, gg_aligned_group, eps=eps)
+                        if norm_restore:
+                            norm_u_aligned = torch.linalg.norm(_flatten(gu_aligned_group))
+                            norm_g_aligned = torch.linalg.norm(_flatten(gg_aligned_group))
+                            norm_u_proj = torch.linalg.norm(_flatten(gu_proj_group))
+                            norm_g_proj = torch.linalg.norm(_flatten(gg_proj_group))
+                            restore_u = norm_u_aligned / (norm_u_proj + eps)
+                            restore_g = norm_g_aligned / (norm_g_proj + eps)
+                            gu_proj_group = [restore_u * gu for gu in gu_proj_group]
+                            gg_proj_group = [restore_g * gg for gg in gg_proj_group]
+                        merged_group = [gu + gg for gu, gg in zip(gu_proj_group, gg_proj_group)]
+            else:
+                if magnitude_scope == "global":
+                    if global_scale_factor is None:
+                        raise RuntimeError("global_scale_factor is unexpectedly None for DSGA-M global mode.")
+                    scale_factor = global_scale_factor
+                elif mode == "capped_full":
+                    scale_factor = torch.clamp(m_u / (m_g + eps), max=align_max_scale).detach()
+                else:
+                    scale_factor = torch.pow((m_u / (m_g + eps)).clamp_min(eps), align_gamma).detach()
+                gg_aligned_group = [scale_factor * gg for gg in gg_group]
+
+                if mode == "magnitude_only":
+                    # Pure MA: never project, always add aligned generation gradient.
+                    if conflict_only and (not is_conflict):
+                        merged_group = [gu + gg for gu, gg in zip(gu_group, gg_group)]
+                    else:
+                        merged_group = [gu + gg_aligned for gu, gg_aligned in zip(gu_group, gg_aligned_group)]
+                else:
+                    # Full DSGA-M + DSGA-D.
+                    if not is_conflict:
+                        if conflict_only:
+                            # Option-1: only decompose conflict groups; non-conflict groups use plain sum.
+                            merged_group = [gu + gg for gu, gg in zip(gu_group, gg_group)]
+                        else:
+                            merged_group = [gu + gg_aligned for gu, gg_aligned in zip(gu_group, gg_aligned_group)]
+                    else:
+                        gg_aligned_flat = _flatten(gg_aligned_group)
+                        proj_coeff = torch.dot(gg_aligned_flat, gu_flat) / (torch.dot(gu_flat, gu_flat) + eps)
+                        gg_perp_group = [gg_aligned - proj_coeff * gu for gu, gg_aligned in zip(gu_group, gg_aligned_group)]
+                        if norm_restore:
+                            norm_aligned = torch.linalg.norm(gg_aligned_flat)
+                            norm_perp = torch.linalg.norm(_flatten(gg_perp_group))
+                            restore_scale = norm_aligned / (norm_perp + eps)
+                            gg_perp_group = [restore_scale * gg_perp for gg_perp in gg_perp_group]
+                        merged_group = [gu + gg_perp for gu, gg_perp in zip(gu_group, gg_perp_group)]
 
         for idx, g in zip(idxs, merged_group):
             merged[idx] = g
@@ -1052,6 +1403,7 @@ def apply_laga_objective(
     lambda_txt: float,
     lambda_rec: float,
     group_to_indices: Optional[Dict[str, Sequence[int]]] = None,
+    preserve_target: str = "understanding",
     eps: float = 1e-8,
     conflict_threshold: float = 0.0,
     restore_ratio: float = 0.0,
@@ -1071,6 +1423,7 @@ def apply_laga_objective(
             grads_u=wg_txt,
             grads_g=wg_rec,
             layers=group_to_indices,
+            preserve_target=preserve_target,
             eps=eps,
             conflict_threshold=conflict_threshold,
             restore_ratio=restore_ratio,
@@ -1103,10 +1456,17 @@ def apply_ma_laga_objective(
     lambda_txt: float,
     lambda_rec: float,
     group_to_indices: Optional[Dict[str, Sequence[int]]] = None,
+    preserve_target: str = "understanding",
     align_gamma: float = 0.5,
     norm_restore: bool = True,
     mode: str = "full",
+    conflict_threshold: float = 0.0,
+    conflict_only: bool = False,
     eps: float = 1e-8,
+    magnitude_scope: str = "layerwise",
+    adaptive_layerwise_blend: bool = False,
+    adaptive_blend_strength: float = 1.0,
+    adaptive_blend_power: float = 0.5,
     grad_norm_mode: str = "none",
     grad_norm_indices: Optional[Sequence[int]] = None,
     grad_norm_conflict_only: bool = False,
@@ -1119,10 +1479,17 @@ def apply_ma_laga_objective(
             grads_u=wg_txt,
             grads_g=wg_rec,
             layers=group_to_indices,
+            preserve_target=preserve_target,
             align_gamma=align_gamma,
             norm_restore=norm_restore,
             mode=mode,
+            conflict_threshold=conflict_threshold,
+            conflict_only=conflict_only,
             eps=eps,
+            magnitude_scope=magnitude_scope,
+            adaptive_layerwise_blend=adaptive_layerwise_blend,
+            adaptive_blend_strength=adaptive_blend_strength,
+            adaptive_blend_power=adaptive_blend_power,
         )
 
     return _apply_multi_objective(

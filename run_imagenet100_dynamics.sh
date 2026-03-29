@@ -4,7 +4,7 @@ set -euo pipefail
 # 用法:
 #   bash run_imagenet100_dynamics.sh
 # 可通过环境变量覆盖默认参数，例如:
-#   NUM_GPUS=8 ENCODER_CKPT=/path/to/dino.pth HF_DATASET_ID=clane9/imagenet-100 BATCH_SIZE=32 MAX_STEPS=1200 bash run_imagenet100_dynamics.sh
+#   NUM_GPUS=8 ENCODER_CKPT=/path/to/dino.pth HF_DATASET_ID=clane9/imagenet-100 BATCH_SIZE=32 LAMBDA_G=100 MAX_STEPS=1200 bash run_imagenet100_dynamics.sh
 
 HF_DATASET_ID="${HF_DATASET_ID:-clane9/imagenet-100}"
 CACHE_DIR="${CACHE_DIR:-}"
@@ -17,6 +17,8 @@ MAX_STEPS="${MAX_STEPS:-1200}"
 PROBE_UNTIL="${PROBE_UNTIL:-1000}"
 PROBE_EVERY="${PROBE_EVERY:-50}"
 LR="${LR:-2e-4}"
+LAMBDA_U="${LAMBDA_U:-1.0}"
+LAMBDA_G="${LAMBDA_G:-100.0}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-results}"
 SEED="${SEED:-42}"
 DEVICE="${DEVICE:-auto}"
@@ -36,6 +38,8 @@ COMMON_ARGS=(
   --probe_until "${PROBE_UNTIL}"
   --probe_every "${PROBE_EVERY}"
   --lr "${LR}"
+  --lambda_u "${LAMBDA_U}"
+  --lambda_g "${LAMBDA_G}"
   --output_root "${OUTPUT_ROOT}"
   --seed "${SEED}"
   --device "${DEVICE}"

@@ -1,6 +1,7 @@
 from typing import Dict, Tuple
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 
@@ -64,3 +65,37 @@ def lpips_score(pred: torch.Tensor, target: torch.Tensor):
         metric = lpips.LPIPS(net="alex").to(pred.device)
         score = metric(pred, target).mean()
     return float(score.item())
+
+
+class FeatureVarianceLoss(nn.Module):
+    """VICReg-style variance regularization to prevent feature collapse."""
+
+    def __init__(self, gamma: float = 1.0, eps: float = 1e-4):
+        super().__init__()
+        self.gamma = float(gamma)
+        self.eps = float(eps)
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        if features.ndim == 4:
+            # [B, C, H, W] -> [B, C] via global average pooling.
+            x = F.adaptive_avg_pool2d(features, output_size=(1, 1)).flatten(1)
+        elif features.ndim == 2:
+            x = features
+        else:
+            raise ValueError(
+                f"FeatureVarianceLoss expects [B, D] or [B, C, H, W], got shape={tuple(features.shape)}"
+            )
+
+        bsz, dim = x.shape
+        if dim <= 0:
+            raise ValueError("FeatureVarianceLoss got empty feature dimension.")
+
+        x_centered = x - x.mean(dim=0, keepdim=True)
+        if bsz > 1:
+            var = (x_centered * x_centered).sum(dim=0) / float(bsz - 1)
+        else:
+            # Degenerate batch: treat variance as zero so hinge is fully active.
+            var = x.new_zeros((dim,))
+
+        std = torch.sqrt(var + self.eps)
+        return torch.relu(self.gamma - std).mean()

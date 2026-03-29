@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-DATA_ROOT=${DATA_ROOT:-/project/peilab/luxiaocheng/projects/unirae_radio/data/cifar100}
+DATA_ROOT=${DATA_ROOT:-/project/peilab/luxiaocheng/projects/DSGA/data/cifar100}
 STEPS=${STEPS:-20000}
 SEED=${SEED:-42}
 RUN_PREFIX=${RUN_PREFIX:-cifar100_cagrad_pareto_tune}
