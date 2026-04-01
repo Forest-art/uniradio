@@ -67,6 +67,11 @@ DSGA_LAYERWISE_GROUPING=${DSGA_LAYERWISE_GROUPING:-layerwise_coarse}
 DSGA_LAYERWISE_GAMMA=${DSGA_LAYERWISE_GAMMA:-0.8}
 DSGA_LAYERWISE_TAU=${DSGA_LAYERWISE_TAU:-0.0}
 DSGA_NORM_RESTORE=${DSGA_NORM_RESTORE:-false}
+ENABLE_NAIVE=${ENABLE_NAIVE:-true}
+ENABLE_PCGRAD=${ENABLE_PCGRAD:-true}
+ENABLE_CAGRAD=${ENABLE_CAGRAD:-true}
+ENABLE_DSGA_GLOBAL=${ENABLE_DSGA_GLOBAL:-true}
+ENABLE_DSGA_LAYERWISE=${ENABLE_DSGA_LAYERWISE:-true}
 
 IFS=',' read -r -a SEED_ARR <<< "${SEEDS}"
 
@@ -195,11 +200,21 @@ append_one() {
 }
 
 for seed in "${SEED_ARR[@]}"; do
-  append_one "in100_main_naive_seed${seed}" "naive" "${seed}" "joint" "0.0" "full" "global" "0.0" "0.0" "false"
-  append_one "in100_main_pcgrad_seed${seed}" "pcgrad" "${seed}" "pcgrad" "0.0" "full" "global" "0.0" "0.0" "false"
-  append_one "in100_main_cagrad_seed${seed}" "cagrad" "${seed}" "cagrad" "${CAGRAD_BETA}" "full" "global" "0.0" "0.0" "false"
-  append_one "in100_main_dsga_global_seed${seed}" "dsga_global" "${seed}" "ma_laga" "0.0" "full" "global" "${DSGA_GLOBAL_GAMMA}" "${DSGA_GLOBAL_TAU}" "${DSGA_NORM_RESTORE}"
-  append_one "in100_main_dsga_layerwise_seed${seed}" "dsga_layerwise" "${seed}" "ma_laga" "0.0" "full" "${DSGA_LAYERWISE_GROUPING}" "${DSGA_LAYERWISE_GAMMA}" "${DSGA_LAYERWISE_TAU}" "${DSGA_NORM_RESTORE}"
+  if bool_flag "${ENABLE_NAIVE}"; then
+    append_one "in100_main_naive_seed${seed}" "naive" "${seed}" "joint" "0.0" "full" "global" "0.0" "0.0" "false"
+  fi
+  if bool_flag "${ENABLE_PCGRAD}"; then
+    append_one "in100_main_pcgrad_seed${seed}" "pcgrad" "${seed}" "pcgrad" "0.0" "full" "global" "0.0" "0.0" "false"
+  fi
+  if bool_flag "${ENABLE_CAGRAD}"; then
+    append_one "in100_main_cagrad_seed${seed}" "cagrad" "${seed}" "cagrad" "${CAGRAD_BETA}" "full" "global" "0.0" "0.0" "false"
+  fi
+  if bool_flag "${ENABLE_DSGA_GLOBAL}"; then
+    append_one "in100_main_dsga_global_seed${seed}" "dsga_global" "${seed}" "ma_laga" "0.0" "full" "global" "${DSGA_GLOBAL_GAMMA}" "${DSGA_GLOBAL_TAU}" "${DSGA_NORM_RESTORE}"
+  fi
+  if bool_flag "${ENABLE_DSGA_LAYERWISE}"; then
+    append_one "in100_main_dsga_layerwise_seed${seed}" "dsga_layerwise" "${seed}" "ma_laga" "0.0" "full" "${DSGA_LAYERWISE_GROUPING}" "${DSGA_LAYERWISE_GAMMA}" "${DSGA_LAYERWISE_TAU}" "${DSGA_NORM_RESTORE}"
+  fi
 done
 
 echo "[done] manifest=${MANIFEST}"

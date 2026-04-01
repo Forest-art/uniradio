@@ -74,6 +74,65 @@ def _safe_cosine_flat(g1: torch.Tensor, g2: torch.Tensor, eps: float = 1e-12) ->
     return float(torch.dot(g1, g2).item() / (n1 * n2 + eps))
 
 
+def _encoder_group_depth_ratio(group_name: str) -> float:
+    """Approximate encoder depth for group-wise reconstruction gating."""
+    name = str(group_name).strip().lower()
+    if name in {"patch_embed", "embeddings", "stem"}:
+        return 0.0
+    if name in {"norm", "fc_norm", "head"}:
+        return 1.0
+    if name.startswith("layer"):
+        suffix = name[len("layer") :]
+        if "." in suffix:
+            suffix = suffix.split(".", 1)[0]
+        try:
+            stage = int(suffix)
+        except ValueError:
+            stage = -1
+        if stage >= 1:
+            return max(0.0, min(1.0, float(stage) / 4.0))
+    if name.startswith("blocks."):
+        suffix = name.split(".", 1)[1]
+        if "_" in suffix:
+            try:
+                hi = int(suffix.split("_")[-1])
+            except ValueError:
+                return 0.5
+            return max(0.0, min(1.0, float(hi + 1) / 12.0))
+        try:
+            block_id = int(suffix)
+        except ValueError:
+            return 0.5
+        return max(0.0, min(1.0, float(block_id + 1) / 12.0))
+    if name == "global":
+        return 0.5
+    return 0.5
+
+
+def _apply_encoder_rec_gate(
+    grads_g: Sequence[torch.Tensor],
+    layers: Optional[Dict[str, Sequence[int]]],
+    encoder_rec_gate_strength: float,
+    encoder_rec_gate_min: float,
+) -> List[torch.Tensor]:
+    strength = float(max(0.0, encoder_rec_gate_strength))
+    if strength <= 0.0:
+        return list(grads_g)
+
+    gate_min = float(min(1.0, max(0.0, encoder_rec_gate_min)))
+    groups = layers if layers else {"global": list(range(len(grads_g)))}
+    gated = list(grads_g)
+    for group_name, raw_indices in groups.items():
+        idxs = [int(i) for i in raw_indices if 0 <= int(i) < len(grads_g)]
+        if len(idxs) == 0:
+            continue
+        depth_ratio = _encoder_group_depth_ratio(group_name)
+        rec_gate = max(gate_min, 1.0 - strength * depth_ratio)
+        for idx in idxs:
+            gated[idx] = rec_gate * gated[idx]
+    return gated
+
+
 def _canonicalize_preserve_target(preserve_target: str) -> str:
     key = str(preserve_target).strip().lower()
     aliases = {
@@ -521,6 +580,8 @@ def apply_ma_laga(
     adaptive_layerwise_blend: bool = False,
     adaptive_blend_strength: float = 1.0,
     adaptive_blend_power: float = 0.5,
+    encoder_rec_gate_strength: float = 0.0,
+    encoder_rec_gate_min: float = 1.0,
 ) -> List[torch.Tensor]:
     """DSGA-M + DSGA-D merge core (legacy name: MA-LAGA).
 
@@ -561,6 +622,8 @@ def apply_ma_laga(
             adaptive_layerwise_blend=adaptive_layerwise_blend,
             adaptive_blend_strength=adaptive_blend_strength,
             adaptive_blend_power=adaptive_blend_power,
+            encoder_rec_gate_strength=0.0,
+            encoder_rec_gate_min=1.0,
         )
 
     eps = float(max(1e-12, eps))
@@ -595,6 +658,12 @@ def apply_ma_laga(
         groups: Dict[str, Sequence[int]] = {"all": list(range(len(grads_u)))}
     else:
         groups = layers
+    grads_g_effective = _apply_encoder_rec_gate(
+        grads_g=grads_g,
+        layers=groups,
+        encoder_rec_gate_strength=encoder_rec_gate_strength,
+        encoder_rec_gate_min=encoder_rec_gate_min,
+    )
 
     adaptive_layerwise_blend = bool(adaptive_layerwise_blend)
     adaptive_blend_strength = float(max(0.0, adaptive_blend_strength))
@@ -602,7 +671,7 @@ def apply_ma_laga(
     if adaptive_layerwise_blend and len(groups) > 1:
         merged_global = apply_ma_laga(
             grads_u=grads_u,
-            grads_g=grads_g,
+            grads_g=grads_g_effective,
             layers={"all": list(range(len(grads_u)))},
             preserve_target=preserve_target,
             align_gamma=align_gamma,
@@ -616,10 +685,12 @@ def apply_ma_laga(
             adaptive_layerwise_blend=False,
             adaptive_blend_strength=adaptive_blend_strength,
             adaptive_blend_power=adaptive_blend_power,
+            encoder_rec_gate_strength=0.0,
+            encoder_rec_gate_min=1.0,
         )
         merged_local = apply_ma_laga(
             grads_u=grads_u,
-            grads_g=grads_g,
+            grads_g=grads_g_effective,
             layers=groups,
             preserve_target=preserve_target,
             align_gamma=align_gamma,
@@ -633,10 +704,12 @@ def apply_ma_laga(
             adaptive_layerwise_blend=False,
             adaptive_blend_strength=adaptive_blend_strength,
             adaptive_blend_power=adaptive_blend_power,
+            encoder_rec_gate_strength=0.0,
+            encoder_rec_gate_min=1.0,
         )
         return _blend_dsga_with_global_anchor(
             grads_u=grads_u,
-            grads_g=grads_g,
+            grads_g=grads_g_effective,
             merged_global=merged_global,
             merged_local=merged_local,
             groups=groups,
@@ -650,7 +723,7 @@ def apply_ma_laga(
     global_scale_g: Optional[torch.Tensor] = None
     if magnitude_scope == "global" and mode not in {"direction_only", "nr_laga"}:
         gu_all = _flatten(grads_u)
-        gg_all = _flatten(grads_g)
+        gg_all = _flatten(grads_g_effective)
         m_u_all = torch.linalg.norm(gu_all)
         m_g_all = torch.linalg.norm(gg_all)
         if preserve_target == "symmetric":
@@ -668,7 +741,7 @@ def apply_ma_laga(
         covered.update(idxs)
 
         gu_group = [grads_u[i] for i in idxs]
-        gg_group = [grads_g[i] for i in idxs]
+        gg_group = [grads_g_effective[i] for i in idxs]
         gu_flat = _flatten(gu_group)
         gg_flat = _flatten(gg_group)
 
@@ -792,7 +865,7 @@ def apply_ma_laga(
 
     for idx in range(len(grads_u)):
         if idx not in covered:
-            merged[idx] = grads_u[idx] + grads_g[idx]
+            merged[idx] = grads_u[idx] + grads_g_effective[idx]
 
     return merged
 
@@ -1467,6 +1540,8 @@ def apply_ma_laga_objective(
     adaptive_layerwise_blend: bool = False,
     adaptive_blend_strength: float = 1.0,
     adaptive_blend_power: float = 0.5,
+    encoder_rec_gate_strength: float = 0.0,
+    encoder_rec_gate_min: float = 1.0,
     grad_norm_mode: str = "none",
     grad_norm_indices: Optional[Sequence[int]] = None,
     grad_norm_conflict_only: bool = False,
@@ -1490,6 +1565,8 @@ def apply_ma_laga_objective(
             adaptive_layerwise_blend=adaptive_layerwise_blend,
             adaptive_blend_strength=adaptive_blend_strength,
             adaptive_blend_power=adaptive_blend_power,
+            encoder_rec_gate_strength=encoder_rec_gate_strength,
+            encoder_rec_gate_min=encoder_rec_gate_min,
         )
 
     return _apply_multi_objective(

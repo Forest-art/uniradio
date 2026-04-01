@@ -33,6 +33,28 @@ class HFImageDataset(Dataset):
         return self.transform(image), int(item.get("label", -1))
 
 
+def _infer_num_classes(hf_ds, label_key: str = "label", fallback: int = 1000) -> int:
+    observed_n = None
+    if hasattr(hf_ds, "unique"):
+        try:
+            uniq = hf_ds.unique(label_key)
+            if len(uniq) > 0:
+                observed_n = int(max(int(x) for x in uniq) + 1)
+        except Exception:
+            pass
+    feat = None
+    if hasattr(hf_ds, "features"):
+        feat = hf_ds.features.get(label_key)
+    if feat is not None and hasattr(feat, "names") and feat.names is not None and len(feat.names) > 0:
+        names_n = int(len(feat.names))
+        if observed_n is not None and observed_n > 0 and observed_n <= names_n:
+            return observed_n
+        return names_n
+    if observed_n is not None:
+        return observed_n
+    return int(fallback)
+
+
 def _build_transform(image_size: int) -> transforms.Compose:
     return transforms.Compose(
         [
@@ -245,7 +267,7 @@ def main() -> None:
         ds_tag = str(args.hf_dataset)
     train_ds = HFImageDataset(train_hf, transform=tfm)
     val_ds = HFImageDataset(val_hf, transform=tfm)
-    num_classes = int(len(train_hf.features["label"].names))
+    num_classes = _infer_num_classes(train_hf, label_key="label", fallback=1000)
 
     train_loader = DataLoader(
         train_ds,

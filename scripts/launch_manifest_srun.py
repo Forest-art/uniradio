@@ -49,7 +49,12 @@ def _read_manifest(path: Path) -> List[Dict[str, str]]:
 
 
 def _is_completed_run(run_dir: Path) -> bool:
-    return (run_dir / "cos_summary.json").exists() and (run_dir / "checkpoints" / "latest.pt").exists()
+    eval_last = run_dir / "eval_last.json"
+    cifar_ckpt = run_dir / "checkpoints" / "latest.pt"
+    in100_ckpt = run_dir / "latest.pt"
+    cifar_done = (run_dir / "cos_summary.json").exists() and cifar_ckpt.exists()
+    in100_done = eval_last.exists() and in100_ckpt.exists()
+    return cifar_done or in100_done
 
 
 def _write_event(path: Path, payload: Dict[str, object]) -> None:

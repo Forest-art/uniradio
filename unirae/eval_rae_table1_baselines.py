@@ -5,6 +5,7 @@ import json
 import sys
 import tempfile
 import time
+from glob import glob
 from itertools import cycle
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -13,7 +14,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import yaml
-from datasets import load_dataset
+from datasets import Dataset as ArrowDataset
+from datasets import concatenate_datasets, load_dataset
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
@@ -35,6 +37,28 @@ class HFImageDataset(Dataset):
             image = image.convert("RGB")
         label = int(item.get("label", -1))
         return self.transform(image), label
+
+
+def _infer_num_classes(hf_ds, label_key: str = "label", fallback: int = 1000) -> int:
+    observed_n = None
+    if hasattr(hf_ds, "unique"):
+        try:
+            uniq = hf_ds.unique(label_key)
+            if len(uniq) > 0:
+                observed_n = int(max(int(x) for x in uniq) + 1)
+        except Exception:
+            pass
+    feat = None
+    if hasattr(hf_ds, "features"):
+        feat = hf_ds.features.get(label_key)
+    if feat is not None and hasattr(feat, "names") and feat.names is not None and len(feat.names) > 0:
+        names_n = int(len(feat.names))
+        if observed_n is not None and observed_n > 0 and observed_n <= names_n:
+            return observed_n
+        return names_n
+    if observed_n is not None:
+        return observed_n
+    return int(fallback)
 
 
 def _import_rae_class(rae_code_root: str):
@@ -78,6 +102,18 @@ def _build_transform(image_size: int) -> transforms.Compose:
             transforms.ToTensor(),
         ]
     )
+
+
+def _load_arrow_cache_split(cache_dir: str, split: str):
+    root = Path(cache_dir).expanduser().resolve()
+    if not root.exists():
+        raise FileNotFoundError(f"hf_local_cache_dir not found: {root}")
+    pattern = str(root / f"*-{split}-*.arrow")
+    files = sorted(glob(pattern))
+    if not files:
+        raise FileNotFoundError(f"No arrow shards found for split='{split}' under: {root}")
+    parts = [ArrowDataset.from_file(path) for path in files]
+    return parts[0] if len(parts) == 1 else concatenate_datasets(parts)
 
 
 @torch.no_grad()
@@ -314,6 +350,11 @@ def main() -> None:
 
     parser.add_argument("--hf_dataset", default="clane9/imagenet-100")
     parser.add_argument("--hf_config", default="")
+    parser.add_argument(
+        "--hf_local_cache_dir",
+        default="",
+        help="Optional local Arrow cache directory. If set, load split shards from disk instead of HuggingFace hub.",
+    )
     parser.add_argument("--train_split", default="train")
     parser.add_argument("--val_split", default="validation")
 
@@ -325,12 +366,20 @@ def main() -> None:
     parser.add_argument("--probe_lr", type=float, default=1e-3)
     parser.add_argument("--probe_weight_decay", type=float, default=0.0)
     parser.add_argument("--probe_log_interval", type=int, default=100)
+    parser.add_argument(
+        "--checkpoint",
+        default="",
+        help="Optional DSGA/RAE checkpoint path. If set, load checkpoint['model'] with strict=False before evaluation.",
+    )
 
     parser.add_argument("--max_eval_batches", type=int, default=0, help="0 means full val set for rMSE/MSE.")
     parser.add_argument("--recon_log_interval", type=int, default=20)
     parser.add_argument("--rfid_num_samples", type=int, default=5000)
     parser.add_argument("--rfid_batch_size", type=int, default=64)
-    parser.add_argument("--rfid_tmp_dir", default="/scratch/peilab/xlubl/tmp_rfid")
+    parser.add_argument(
+        "--rfid_tmp_dir",
+        default="/project/peilab/luxiaocheng/projects/DSGA/results/in1k_rfid_tmp",
+    )
     parser.add_argument("--rfid_log_interval", type=int, default=500)
 
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
@@ -342,36 +391,48 @@ def main() -> None:
     else:
         device = torch.device(args.device)
 
+    Path(args.rfid_tmp_dir).mkdir(parents=True, exist_ok=True)
+
     t0 = time.time()
     stage1_params = _resolve_stage1_params(args.stage1_config, args.rae_code_root)
     image_size = int(args.image_size) if int(args.image_size) > 0 else int(stage1_params.get("encoder_input_size", 256))
     tfm = _build_transform(image_size=image_size)
 
-    hf_cfg = str(args.hf_config).strip()
-    if hf_cfg:
-        train_hf = load_dataset(args.hf_dataset, hf_cfg, split=args.train_split)
-        val_hf = load_dataset(args.hf_dataset, hf_cfg, split=args.val_split)
-        dataset_tag = f"{args.hf_dataset}:{hf_cfg}"
+    train_hf = None
+    hf_local_cache_dir = str(args.hf_local_cache_dir).strip()
+    if hf_local_cache_dir:
+        if int(args.probe_steps) > 0:
+            train_hf = _load_arrow_cache_split(hf_local_cache_dir, str(args.train_split))
+        val_hf = _load_arrow_cache_split(hf_local_cache_dir, str(args.val_split))
+        dataset_tag = f"arrow:{Path(hf_local_cache_dir).resolve()}"
     else:
-        train_hf = load_dataset(args.hf_dataset, split=args.train_split)
-        val_hf = load_dataset(args.hf_dataset, split=args.val_split)
-        dataset_tag = str(args.hf_dataset)
+        hf_cfg = str(args.hf_config).strip()
+        if hf_cfg:
+            if int(args.probe_steps) > 0:
+                train_hf = load_dataset(args.hf_dataset, hf_cfg, split=args.train_split)
+            val_hf = load_dataset(args.hf_dataset, hf_cfg, split=args.val_split)
+            dataset_tag = f"{args.hf_dataset}:{hf_cfg}"
+        else:
+            if int(args.probe_steps) > 0:
+                train_hf = load_dataset(args.hf_dataset, split=args.train_split)
+            val_hf = load_dataset(args.hf_dataset, split=args.val_split)
+            dataset_tag = str(args.hf_dataset)
 
-    train_ds = HFImageDataset(train_hf, transform=tfm)
     val_ds = HFImageDataset(val_hf, transform=tfm)
-    if hasattr(train_hf.features.get("label", None), "names") and train_hf.features["label"].names is not None:
-        num_classes = int(len(train_hf.features["label"].names))
-    else:
-        num_classes = int(len(train_hf.unique("label")))
+    source = train_hf if train_hf is not None else val_hf
+    num_classes = _infer_num_classes(source, label_key="label", fallback=1000)
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=int(args.batch_size),
-        shuffle=True,
-        num_workers=int(args.num_workers),
-        pin_memory=True,
-        drop_last=False,
-    )
+    train_loader = None
+    if train_hf is not None:
+        train_ds = HFImageDataset(train_hf, transform=tfm)
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=int(args.batch_size),
+            shuffle=True,
+            num_workers=int(args.num_workers),
+            pin_memory=True,
+            drop_last=False,
+        )
     val_loader = DataLoader(
         val_ds,
         batch_size=int(args.batch_size),
@@ -384,30 +445,58 @@ def main() -> None:
     RAE = _import_rae_class(args.rae_code_root)
     model = RAE(**stage1_params).to(device)
     model.eval()
+    load_missing_count = 0
+    load_unexpected_count = 0
+    checkpoint_path = str(args.checkpoint).strip()
+    if checkpoint_path:
+        ckpt_path = Path(checkpoint_path).expanduser().resolve()
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
+        ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+        state_model = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+        load_ret = model.load_state_dict(state_model, strict=False)
+        load_missing_count = int(len(load_ret.missing_keys))
+        load_unexpected_count = int(len(load_ret.unexpected_keys))
+        print(
+            f"[load] checkpoint={ckpt_path} missing={load_missing_count} unexpected={load_unexpected_count}",
+            flush=True,
+        )
 
     print(f"[setup] device={device} dataset={dataset_tag} image_size={image_size} num_classes={num_classes}")
     print(f"[setup] stage1_config={Path(args.stage1_config).resolve()}")
     print(f"[setup] stage1_params.encoder_cls={stage1_params.get('encoder_cls', '')}")
     print(
-        f"[setup] train_batches={len(train_loader)} val_batches={len(val_loader)} "
+        f"[setup] train_batches={(len(train_loader) if train_loader is not None else 0)} val_batches={len(val_loader)} "
         f"probe_steps={int(args.probe_steps)}",
         flush=True,
     )
 
-    lp_t0 = time.time()
-    probe_ret = evaluate_linear_probe(
-        rae_model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        num_classes=int(num_classes),
-        device=device,
-        max_steps=int(args.probe_steps),
-        lr=float(args.probe_lr),
-        weight_decay=float(args.probe_weight_decay),
-        probe_log_interval=int(args.probe_log_interval),
-    )
-    probe_wall = time.time() - lp_t0
-    print(f"[linear_probe] top1={probe_ret['linear_probe_top1']:.4f} wall={probe_wall:.1f}s")
+    probe_wall = 0.0
+    if int(args.probe_steps) > 0:
+        if train_loader is None:
+            raise RuntimeError("probe_steps > 0 requires a train split to be loaded")
+        lp_t0 = time.time()
+        probe_ret = evaluate_linear_probe(
+            rae_model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            num_classes=int(num_classes),
+            device=device,
+            max_steps=int(args.probe_steps),
+            lr=float(args.probe_lr),
+            weight_decay=float(args.probe_weight_decay),
+            probe_log_interval=int(args.probe_log_interval),
+        )
+        probe_wall = time.time() - lp_t0
+        print(f"[linear_probe] top1={probe_ret['linear_probe_top1']:.4f} wall={probe_wall:.1f}s")
+    else:
+        probe_ret = {
+            "linear_probe_top1": float("nan"),
+            "linear_probe_top1_percent": float("nan"),
+            "probe_steps": 0,
+            "num_val_samples": 0,
+        }
+        print("[linear_probe] skipped (probe_steps<=0)", flush=True)
 
     rec_t0 = time.time()
     recon_ret = evaluate_reconstruction(
@@ -441,6 +530,7 @@ def main() -> None:
 
     out = {
         "stage1_config": str(Path(args.stage1_config).resolve()),
+        "checkpoint": str(Path(checkpoint_path).expanduser().resolve()) if checkpoint_path else "",
         "dataset": dataset_tag,
         "train_split": str(args.train_split),
         "val_split": str(args.val_split),
@@ -448,6 +538,8 @@ def main() -> None:
         "batch_size": int(args.batch_size),
         "image_size": int(image_size),
         "num_classes": int(num_classes),
+        "load_missing_count": int(load_missing_count),
+        "load_unexpected_count": int(load_unexpected_count),
         "probe": probe_ret,
         "reconstruction": recon_ret,
         "rfid": {

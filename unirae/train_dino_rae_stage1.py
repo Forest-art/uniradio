@@ -192,7 +192,7 @@ class RAEModules:
     hinge_d_loss: object
     vanilla_d_loss: object
     vanilla_g_loss: object
-    evaluate_reconstruction_distributed: object
+    evaluate_reconstruction_distributed: object | None
 
 
 def _import_rae_modules(rae_code_root: str) -> RAEModules:
@@ -200,14 +200,18 @@ def _import_rae_modules(rae_code_root: str) -> RAEModules:
     if src_dir not in sys.path:
         sys.path.insert(0, src_dir)
     disc_mod = importlib.import_module("disc")
-    eval_mod = importlib.import_module("eval")
+    try:
+        eval_mod = importlib.import_module("eval")
+        eval_fn = eval_mod.evaluate_reconstruction_distributed
+    except Exception:
+        eval_fn = None
     return RAEModules(
         LPIPS=disc_mod.LPIPS,
         build_discriminator=disc_mod.build_discriminator,
         hinge_d_loss=disc_mod.hinge_d_loss,
         vanilla_d_loss=disc_mod.vanilla_d_loss,
         vanilla_g_loss=disc_mod.vanilla_g_loss,
-        evaluate_reconstruction_distributed=eval_mod.evaluate_reconstruction_distributed,
+        evaluate_reconstruction_distributed=eval_fn,
     )
 
 

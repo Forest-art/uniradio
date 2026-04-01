@@ -1618,6 +1618,20 @@ def main() -> None:
         train_cfg.get("dsga_preserve_target", train_cfg.get("ma_laga_preserve_target", "understanding")),
         key="train.dsga_preserve_target",
     )
+    enc_anchor_rec_gate_strength = float(
+        train_cfg.get("enc_anchor_rec_gate_strength", train_cfg.get("dsga_enc_anchor_rec_gate_strength", 0.0))
+    )
+    if enc_anchor_rec_gate_strength < 0.0:
+        raise ValueError(
+            f"Unsupported train.enc_anchor_rec_gate_strength={enc_anchor_rec_gate_strength}. Must be >= 0."
+        )
+    enc_anchor_rec_gate_min = float(
+        train_cfg.get("enc_anchor_rec_gate_min", train_cfg.get("dsga_enc_anchor_rec_gate_min", 1.0))
+    )
+    if not (0.0 <= enc_anchor_rec_gate_min <= 1.0):
+        raise ValueError(
+            f"Unsupported train.enc_anchor_rec_gate_min={enc_anchor_rec_gate_min}. Must be in [0, 1]."
+        )
 
     saop_eps = float(train_cfg.get("saop_eps", 1e-8))
     saop_log_norm_ratio_raw = train_cfg.get("saop_log_norm_ratio", False)
@@ -1743,6 +1757,10 @@ def main() -> None:
                 "dsga_layer_adaptive_strength": dsga_layer_adaptive_strength,
                 "dsga_layer_adaptive_power": dsga_layer_adaptive_power,
                 "dsga_m_eps": dsga_m_eps,
+                "enc_anchor_rec_gate_strength": enc_anchor_rec_gate_strength,
+                "enc_anchor_rec_gate_min": enc_anchor_rec_gate_min,
+                "dsga_enc_anchor_rec_gate_strength": enc_anchor_rec_gate_strength,
+                "dsga_enc_anchor_rec_gate_min": enc_anchor_rec_gate_min,
                 # Legacy aliases kept for old downstream parsers.
                 "ma_laga_align_gamma": dsga_m_align_gamma,
                 "ma_laga_m_scope": dsga_m_scope,
@@ -2090,6 +2108,8 @@ def main() -> None:
                 adaptive_layerwise_blend=dsga_layer_adaptive_blend,
                 adaptive_blend_strength=dsga_layer_adaptive_strength,
                 adaptive_blend_power=dsga_layer_adaptive_power,
+                encoder_rec_gate_strength=enc_anchor_rec_gate_strength,
+                encoder_rec_gate_min=enc_anchor_rec_gate_min,
                 grad_norm_mode=grad_norm_mode,
                 grad_norm_indices=grad_norm_indices,
                 grad_norm_conflict_only=grad_norm_conflict_only,
@@ -2299,6 +2319,10 @@ def main() -> None:
             "dsga_layer_adaptive_strength": dsga_layer_adaptive_strength,
             "dsga_layer_adaptive_power": dsga_layer_adaptive_power,
             "dsga_m_eps": dsga_m_eps,
+            "enc_anchor_rec_gate_strength": enc_anchor_rec_gate_strength,
+            "enc_anchor_rec_gate_min": enc_anchor_rec_gate_min,
+            "dsga_enc_anchor_rec_gate_strength": enc_anchor_rec_gate_strength,
+            "dsga_enc_anchor_rec_gate_min": enc_anchor_rec_gate_min,
             # Legacy aliases kept for old downstream parsers.
             "ma_laga_align_gamma": dsga_m_align_gamma,
             "ma_laga_m_scope": dsga_m_scope,
